@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict';
 import { execFile, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { once } from 'node:events';
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises';
+import { createConnection } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PassThrough } from 'node:stream';
@@ -10,7 +12,7 @@ import { setImmediate, setTimeout as delay } from 'node:timers/promises';
 import { connect } from 'node:tls';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
-import { FrameReader, writeFrame } from '../dist/protocol.js';
+import { FrameReader, MAX_PAYLOAD, writeFrame } from '../dist/protocol.js';
 
 const project = fileURLToPath(new URL('../', import.meta.url));
 const execNode = promisify(execFile);
@@ -37,10 +39,10 @@ function launch(args, timeout = 8000) {
   return { child, done, stdout: () => stdout, stderr: () => stderr };
 }
 
-async function waitForOutput(process, pattern, offset = 0) {
+async function waitForOutput(process, pattern, offset = 0, output = 'stdout') {
   const until = Date.now() + 4000;
   do {
-    const match = process.stdout().slice(offset).match(pattern);
+    const match = process[output]().slice(offset).match(pattern);
     if (match) return match;
     if (process.child.exitCode !== null || process.child.signalCode !== null) break;
     await delay(20);
@@ -48,8 +50,8 @@ async function waitForOutput(process, pattern, offset = 0) {
   assert.fail(`Timed out waiting for ${pattern}.\nstdout: ${process.stdout()}\nstderr: ${process.stderr()}`);
 }
 
-function launchClient(name) {
-  return launch(['dist/client.js', join(runtime, `${name}.json`)]);
+function launchClient(name, timeout) {
+  return launch(['dist/client.js', join(runtime, `${name}.json`)], timeout);
 }
 
 function batchClient(name, commands) {
@@ -270,4 +272,348 @@ test('server and client refuse overwrites and preserve both original files', asy
   assert.deepEqual(await readFile(downloaded), first);
   assert.deepEqual(await readFile(join(runtime, 'storage', 'bob', 'fixed.bin')), first);
   assert((await readdir(root)).every(name => !name.endsWith('.part')));
+});
+
+async function peerOptions(name, certificateDir = runtime) {
+  const config = JSON.parse(await readFile(join(certificateDir, `${name}.json`), 'utf8'));
+  const [ca, cert, key] = await Promise.all([
+    readFile(join(runtime, config.ca)),
+    readFile(join(certificateDir, config.cert)),
+    readFile(join(certificateDir, config.key)),
+  ]);
+  return {
+    host: '127.0.0.1', port, servername: 'localhost', ca, cert, key,
+    minVersion: 'TLSv1.3', rejectUnauthorized: true,
+  };
+}
+
+function waitForClose(socket, timeout = 3000) {
+  if (socket.closed) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const deadline = setTimeout(() => {
+      socket.destroy();
+      reject(new Error(`Socket did not close within ${timeout} ms`));
+    }, timeout);
+    socket.once('close', () => {
+      clearTimeout(deadline);
+      resolve();
+    });
+  });
+}
+
+async function openPeer(t, name) {
+  const socket = connect(await peerOptions(name));
+  socket.on('error', () => {});
+  t.after(() => socket.destroy());
+  await once(socket, 'secureConnect', { signal: AbortSignal.timeout(3000) });
+  return { socket, reader: new FrameReader(socket) };
+}
+
+async function exchange(peer, header, payload) {
+  await writeFrame(peer.socket, header, payload);
+  const frame = await peer.reader.read();
+  assert(frame, `No response to ${header.op}`);
+  assert.equal(frame.header.op, header.op);
+  return frame;
+}
+
+async function quitPeer(peer) {
+  assert.equal((await exchange(peer, { op: 'quit' })).header.status, 'ok');
+  const closed = waitForClose(peer.socket);
+  peer.socket.end();
+  await closed;
+}
+
+async function requireRejectedPeer(options) {
+  const socket = connect(options);
+  let received = 0;
+  socket.on('error', () => {});
+  socket.on('data', data => { received += data.length; });
+  socket.once('secureConnect', () => {
+    void writeFrame(socket, { op: 'list' }).catch(() => {});
+  });
+  try {
+    await waitForClose(socket);
+    assert.equal(received, 0);
+  } finally {
+    socket.destroy();
+  }
+}
+
+test('CLI round trips zero bytes and exactly 8 MiB, rejecting a local file one byte larger', async () => {
+  const empty = join(root, 'empty.input');
+  const maximum = join(root, 'maximum.input');
+  const oversized = join(root, 'oversized.input');
+  const emptyOutput = join(root, 'empty.output');
+  const maximumOutput = join(root, 'maximum.output');
+  const data = Buffer.alloc(MAX_PAYLOAD).fill(Buffer.from([0, 129, 255, 4]));
+  await Promise.all([
+    writeFile(empty, Buffer.alloc(0)), writeFile(maximum, data),
+    writeFile(oversized, Buffer.alloc(MAX_PAYLOAD + 1)),
+  ]);
+  const result = await batchClient('alice', [
+    `put ${quoted(empty)} empty.bin`, `get empty.bin ${quoted(emptyOutput)}`,
+    `put ${quoted(maximum)} maximum.bin`, `get maximum.bin ${quoted(maximumOutput)}`,
+    `put ${quoted(oversized)} oversized.bin`, 'list', 'quit',
+  ]);
+  assert.equal(result.code, 1, JSON.stringify(result));
+  assert.match(result.stdout, /^PUT empty\.bin 0 bytes SHA-256 [a-f0-9]{64}$/m);
+  assert.match(result.stdout, /^GET maximum\.bin 8388608 bytes SHA-256 [a-f0-9]{64}$/m);
+  assert.doesNotMatch(result.stdout, /oversized\.bin/);
+  assert.match(result.stdout, /^BYE$/m);
+  assert.match(result.stderr, /at most 8 MiB/);
+  assert.deepEqual(await readFile(emptyOutput), Buffer.alloc(0));
+  assert.deepEqual(await readFile(maximumOutput), data);
+});
+
+test('digest mismatch and illegal names produce errors without writing files', { timeout: 6000 }, async t => {
+  const directory = join(runtime, 'storage', 'alice');
+  const previous = (await readdir(directory)).sort();
+  const peer = await openPeer(t, 'alice');
+  const payload = Buffer.from('contents');
+  const bad = await exchange(peer, { op: 'put', name: 'mismatch.bin', sha256: '0'.repeat(64) }, payload);
+  assert.deepEqual(bad.header, { op: 'put', status: 'error', message: 'File digest mismatch' });
+  const illegal = await exchange(peer, { op: 'put', name: '../outside.bin' }, payload);
+  assert.deepEqual(illegal.header, { op: 'put', status: 'error', message: 'Invalid file name' });
+  assert.deepEqual((await readdir(directory)).sort(), previous);
+  await quitPeer(peer);
+});
+
+test('missing file, unknown operation and inappropriate payload recover on the same session', {
+  timeout: 6000,
+}, async t => {
+  const peer = await openPeer(t, 'alice');
+  const cases = [
+    [{ op: 'get', name: 'absent.bin' }, undefined, 'File is unavailable'],
+    [{ op: 'unexpected' }, undefined, 'Unknown operation'],
+    [{ op: 'list' }, Buffer.from('ordinary data'), 'Unexpected file payload'],
+  ];
+  for (const [header, payload, message] of cases) {
+    const response = await exchange(peer, header, payload);
+    assert.deepEqual(response.header, { op: header.op, status: 'error', message });
+    assert.equal(response.payload.length, 0);
+  }
+  assert.equal((await exchange(peer, { op: 'ping' })).header.status, 'ok');
+  assert.equal((await exchange(peer, { op: 'list' })).header.status, 'ok');
+  await quitPeer(peer);
+});
+
+test('directory entries that are symbolic links cannot be listed, read or overwritten', {
+  timeout: 6000,
+}, async t => {
+  const outside = join(root, 'outside-data.txt');
+  const alias = join(runtime, 'storage', 'alice', 'alias.txt');
+  const contents = Buffer.from('outside the managed directory');
+  await writeFile(outside, contents);
+  try {
+    await symlink(outside, alias);
+  } catch (error) {
+    if (process.platform === 'win32' && error.code === 'EPERM') {
+      t.skip('Creating test symlinks requires local Windows privileges');
+      return;
+    }
+    throw error;
+  }
+  t.after(() => rm(alias, { force: true }));
+
+  const peer = await openPeer(t, 'alice');
+  const listed = await exchange(peer, { op: 'list' });
+  assert(!listed.header.files.some(file => file.name === 'alias.txt'));
+  const downloaded = await exchange(peer, { op: 'get', name: 'alias.txt' });
+  assert.deepEqual(downloaded.header, { op: 'get', status: 'error', message: 'File is unavailable' });
+  assert.equal(downloaded.payload.length, 0);
+  const replacement = Buffer.from('replacement');
+  const sha256 = createHash('sha256').update(replacement).digest('hex');
+  const uploaded = await exchange(peer, { op: 'put', name: 'alias.txt', sha256 }, replacement);
+  assert.deepEqual(uploaded.header, { op: 'put', status: 'error', message: 'File already exists' });
+  assert.deepEqual(await readFile(outside), contents);
+  await quitPeer(peer);
+});
+
+test('a second session with the same client certificate is rejected without disrupting the first', {
+  timeout: 6000,
+}, async t => {
+  const start = server.stdout().length;
+  const peer = await openPeer(t, 'alice');
+  assert.equal((await exchange(peer, { op: 'ping' })).header.status, 'ok');
+  await requireRejectedPeer(await peerOptions('alice'));
+  assert.equal((await exchange(peer, { op: 'ping' })).header.status, 'ok');
+  await quitPeer(peer);
+  await waitForOutput(server, /^SESSION \d+ END alice$/m, start);
+  assert.equal([...server.stdout().slice(start).matchAll(/^SESSION \d+ OPEN alice /gm)].length, 1);
+});
+
+test('a certificate issued by another local CA grants no application access', { timeout: 6000 }, async () => {
+  const alternate = join(root, 'other-ca');
+  await execNode(process.execPath, ['scripts/setup.mjs', alternate], {
+    cwd: project, env: { ...process.env, SFT_PORT: '0' }, timeout: 5000,
+  });
+  const start = server.stdout().length;
+  await requireRejectedPeer(await peerOptions('alice', alternate));
+  assert.doesNotMatch(server.stdout().slice(start), /^SESSION \d+ OPEN /m);
+});
+
+test('a valid TLS client certificate outside the server account map is refused', { timeout: 8000 }, async t => {
+  const config = JSON.parse(await readFile(join(runtime, 'server.json'), 'utf8'));
+  delete config.users.bob;
+  const file = join(runtime, 'single-account.json');
+  await writeFile(file, JSON.stringify(config));
+  const filtered = launch(['dist/server.js', file]);
+  filtered.child.stdin.end();
+  t.after(async () => {
+    filtered.child.kill('SIGTERM');
+    await filtered.done;
+  });
+  const [, listeningPort] = await waitForOutput(filtered, /^LISTEN 127\.0\.0\.1:(\d+)$/m);
+  await requireRejectedPeer({ ...await peerOptions('bob'), port: Number(listeningPort) });
+  assert.doesNotMatch(filtered.stdout(), /^SESSION \d+ OPEN /m);
+});
+
+test('server startup validates account name, fingerprint uniqueness and private storage', async () => {
+  const config = JSON.parse(await readFile(join(runtime, 'server.json'), 'utf8'));
+  const { alice } = config.users;
+  const publicDirectory = join(runtime, 'storage', 'public');
+  await mkdir(publicDirectory, { mode: 0o755 });
+  const cases = [
+    ['empty', {}, /Configure at least one client certificate/],
+    ['invalid-name', { Alice: alice }, /Invalid account configuration/],
+    ['invalid-fingerprint', { alice: 'invalid' }, /Invalid account configuration/],
+    ['duplicate', { alice, bob: alice }, /Invalid account configuration/],
+  ];
+  if (process.platform !== 'win32') {
+    await chmod(publicDirectory, 0o755);
+    cases.push(['public-directory', { public: alice }, /Storage must be a private directory/]);
+  }
+  for (const [name, users, expected] of cases) {
+    const file = join(runtime, `invalid-${name}.json`);
+    await writeFile(file, JSON.stringify({ ...config, users }));
+    const invalid = launch(['dist/server.js', file], 2000);
+    invalid.child.stdin.end();
+    const result = await invalid.done;
+    assert.equal(result.code, 1, JSON.stringify(result));
+    assert.match(result.stderr, expected);
+    assert.doesNotMatch(result.stdout, /^LISTEN /m);
+  }
+});
+
+test('seventeenth stored file is refused and account quota remains sixteen', { timeout: 6000 }, async t => {
+  const peer = await openPeer(t, 'bob');
+  const payload = Buffer.alloc(0);
+  const sha256 = createHash('sha256').update(payload).digest('hex');
+  const initial = (await exchange(peer, { op: 'list' })).header.files;
+  for (let index = initial.length; index < 16; index++) {
+    const name = `quota-${index}.bin`;
+    const stored = await exchange(peer, { op: 'put', name, sha256 }, payload);
+    assert.equal(stored.header.status, 'ok', JSON.stringify(stored.header));
+    t.after(() => rm(join(runtime, 'storage', 'bob', name), { force: true }));
+  }
+  const excess = await exchange(peer, { op: 'put', name: 'quota-excess.bin', sha256 }, payload);
+  assert.deepEqual(excess.header, { op: 'put', status: 'error', message: 'Storage is full' });
+  assert.equal((await exchange(peer, { op: 'list' })).header.files.length, 16);
+  await quitPeer(peer);
+});
+
+test('disconnect during a valid upload leaves no partial file and releases the session', {
+  timeout: 8000,
+}, async t => {
+  const start = server.stdout().length;
+  const directory = join(runtime, 'storage', 'alice');
+  const previous = (await readdir(directory)).sort();
+  const peer = await openPeer(t, 'alice');
+  const payload = Buffer.from('partial upload fixture');
+  const sha256 = createHash('sha256').update(payload).digest('hex');
+  const recorded = [];
+  const stream = new PassThrough();
+  stream.on('data', chunk => recorded.push(chunk));
+  await writeFrame(stream, { op: 'put', name: 'interrupted.bin', sha256 }, payload);
+  stream.end();
+  const wire = Buffer.concat(recorded);
+  const closed = waitForClose(peer.socket);
+  peer.socket.end(wire.subarray(0, wire.length - 5));
+  await closed;
+  await waitForOutput(server, /^SESSION \d+ END alice$/m, start);
+  assert.deepEqual((await readdir(directory)).sort(), previous);
+  requireSuccess(await batchClient('alice', ['list', 'quit']));
+});
+
+test('120 ordinary operations are allowed in a session and the next reaches the budget', {
+  timeout: 8000,
+}, async t => {
+  const start = server.stdout().length;
+  const peer = await openPeer(t, 'alice');
+  for (let request = 0; request < 120; request++) {
+    assert.equal((await exchange(peer, { op: 'ping' })).header.status, 'ok');
+  }
+  const closed = waitForClose(peer.socket);
+  await writeFrame(peer.socket, { op: 'ping' });
+  await closed;
+  await waitForOutput(server, /^SESSION \d+ END alice$/m, start);
+  await waitForOutput(server, /Session request limit exceeded/, 0, 'stderr');
+  requireSuccess(await batchClient('alice', ['list', 'quit']));
+});
+
+test('connection cap refuses the thirteenth socket and releases capacity after close', {
+  timeout: 6000,
+}, async t => {
+  const quiet = [];
+  try {
+    for (let index = 0; index < 12; index++) {
+      const socket = createConnection({ host: '127.0.0.1', port });
+      socket.on('error', () => {});
+      quiet.push(socket);
+      await once(socket, 'connect', { signal: AbortSignal.timeout(2000) });
+    }
+    const excess = createConnection({ host: '127.0.0.1', port });
+    excess.on('error', () => {});
+    try {
+      await waitForClose(excess, 2000);
+      assert(quiet.every(socket => !socket.closed));
+    } finally {
+      excess.destroy();
+    }
+  } finally {
+    const closed = quiet.map(socket => waitForClose(socket));
+    quiet.forEach(socket => socket.end());
+    await Promise.all(closed);
+  }
+  const restored = await openPeer(t, 'alice');
+  assert.equal((await exchange(restored, { op: 'ping' })).header.status, 'ok');
+  await quitPeer(restored);
+});
+
+test('real-time deadlines expire incomplete peers while heartbeat preserves a healthy session', {
+  timeout: 54000,
+}, async t => {
+  const bob = launchClient('bob', 52000);
+  t.after(async () => {
+    bob.child.kill('SIGTERM');
+    await bob.done;
+  });
+  await waitForOutput(bob, /^CONNECTED TLSv1\.3$/m);
+  const bobIdleStarted = performance.now();
+  const errorsBefore = server.stderr().length;
+
+  const handshakeStarted = performance.now();
+  const noHandshake = createConnection({ host: '127.0.0.1', port });
+  noHandshake.on('error', () => {});
+  t.after(() => noHandshake.destroy());
+  const handshakeClosed = waitForClose(noHandshake, 8000).then(() => performance.now() - handshakeStarted);
+
+  const alice = await openPeer(t, 'alice');
+  assert.equal((await exchange(alice, { op: 'ping' })).header.status, 'ok');
+  const frameStarted = performance.now();
+  const requestClosed = waitForClose(alice.socket, 49000).then(() => performance.now() - frameStarted);
+  alice.socket.write(Buffer.from('SFT'));
+  const [handshakeMs, requestMs] = await Promise.all([handshakeClosed, requestClosed]);
+  assert(handshakeMs >= 4600, `Handshake closed after ${handshakeMs} ms`);
+  assert(requestMs >= 44800, `Incomplete frame closed after ${requestMs} ms`);
+  await waitForOutput(server, /Request deadline exceeded/, errorsBefore, 'stderr');
+  await delay(Math.max(0, 45100 - (performance.now() - bobIdleStarted)));
+
+  bob.child.stdin.end('list\nquit\n');
+  const result = await bob.done;
+  requireSuccess(result);
+  assert.match(result.stdout, /^LIST \d+$/m);
+  assert.match(result.stdout, /^BYE$/m);
+  t.diagnostic(`TLS handshake expired in ${Math.round(handshakeMs)} ms, incomplete frame expired in ${Math.round(requestMs)} ms.`);
 });
