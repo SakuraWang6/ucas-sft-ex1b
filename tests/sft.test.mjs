@@ -12,7 +12,7 @@ import { setImmediate, setTimeout as delay } from 'node:timers/promises';
 import { connect } from 'node:tls';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
-import { CHUNK_BYTES, FrameReader, MAX_PAYLOAD, writeFrame } from '../dist/protocol.js';
+import { CHUNK_BYTES, FrameReader, MAX_ACCOUNT_CONNECTIONS, MAX_PAYLOAD, writeFrame } from '../dist/protocol.js';
 
 const project = fileURLToPath(new URL('../', import.meta.url));
 const execNode = promisify(execFile);
@@ -510,17 +510,62 @@ test('directory entries that are symbolic links cannot be listed, read or overwr
   await quitPeer(peer);
 });
 
-test('a second session with the same client certificate is rejected without disrupting the first', {
-  timeout: 6000,
+test('the same certificate can open four TLS sessions and the fifth is refused until capacity frees', {
+  timeout: 8000,
 }, async t => {
+  assert.equal(MAX_ACCOUNT_CONNECTIONS, 4);
   const start = server.stdout().length;
-  const peer = await openPeer(t, 'alice');
-  assert.equal((await exchange(peer, { op: 'ping' })).header.status, 'ok');
+  const peers = [];
+  for (let index = 0; index < MAX_ACCOUNT_CONNECTIONS; index++) {
+    const peer = await openPeer(t, 'alice');
+    assert.equal((await exchange(peer, { op: 'ping' })).header.status, 'ok');
+    peers.push(peer);
+  }
   await requireRejectedPeer(await peerOptions('alice'));
-  assert.equal((await exchange(peer, { op: 'ping' })).header.status, 'ok');
-  await quitPeer(peer);
+  const replies = await Promise.all(peers.map(peer => exchange(peer, { op: 'ping' })));
+  assert(replies.every(reply => reply.header.status === 'ok'));
+  await quitPeer(peers.pop());
   await waitForOutput(server, /^SESSION \d+ END alice$/m, start);
-  assert.equal([...server.stdout().slice(start).matchAll(/^SESSION \d+ OPEN alice /gm)].length, 1);
+  const replacement = await openPeer(t, 'alice');
+  assert.equal((await exchange(replacement, { op: 'ping' })).header.status, 'ok');
+  await Promise.all([...peers, replacement].map(quitPeer));
+  assert.equal([...server.stdout().slice(start).matchAll(/^SESSION \d+ OPEN alice /gm)].length, 5);
+});
+
+test('same-account sessions transfer different files concurrently without overlapping one upload', {
+  timeout: 8000,
+}, async t => {
+  const first = await openPeer(t, 'alice');
+  const second = await openPeer(t, 'alice');
+  const third = await openPeer(t, 'alice');
+  const left = Buffer.from('left file bytes');
+  const right = Buffer.from('right file bytes');
+  const metadata = (name, payload) => ({ name, sha256: createHash('sha256').update(payload).digest('hex') });
+  const leftFile = metadata('parallel-left.bin', left);
+  const rightFile = metadata('parallel-right.bin', right);
+  async function begin(peer, file, payload) {
+    assert.equal((await exchange(peer, { op: 'put-begin', ...file, bytes: payload.length })).header.offset, 0);
+  }
+  await Promise.all([begin(first, leftFile, left), begin(second, rightFile, right)]);
+  const [overlapping, other] = await Promise.all([
+    Promise.all([first, second].map(peer => exchange(peer, { op: 'put-chunk', ...leftFile, offset: 0 }, left))),
+    exchange(third, { op: 'put-chunk', ...rightFile, offset: 0 }, right),
+  ]);
+  assert.deepEqual(overlapping.map(result => result.header.status).sort(), ['error', 'ok']);
+  assert.match(overlapping.find(result => result.header.status === 'error').header.message, /File is busy|Upload offset does not match/);
+  assert.equal(other.header.offset, right.length);
+  const finished = await Promise.all([
+    exchange(first, { op: 'put-finish', ...leftFile }),
+    exchange(second, { op: 'put-finish', ...rightFile }),
+  ]);
+  assert(finished.every(result => result.header.status === 'ok'));
+  const [downloadLeft, downloadRight] = await Promise.all([
+    exchange(second, { op: 'get-chunk', ...leftFile, offset: 0, bytes: left.length }),
+    exchange(first, { op: 'get-chunk', ...rightFile, offset: 0, bytes: right.length }),
+  ]);
+  assert.deepEqual(downloadLeft.payload, left);
+  assert.deepEqual(downloadRight.payload, right);
+  await Promise.all([first, second, third].map(quitPeer));
 });
 
 test('a certificate issued by another local CA grants no application access', { timeout: 6000 }, async () => {

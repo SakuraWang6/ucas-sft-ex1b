@@ -2,7 +2,8 @@ import { readFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { createServer, type TLSSocket } from 'node:tls';
 import {
-  CHUNK_BYTES, MAX_PAYLOAD, FrameReader, digest, validDigest, validName, writeFrame, type Frame,
+  CHUNK_BYTES, MAX_ACCOUNT_CONNECTIONS, MAX_PAYLOAD, FrameReader, digest, validDigest, validName,
+  writeFrame, type Frame,
 } from './protocol.js';
 import { AccountStorage, requirePrivateDirectory, RequestError } from './storage.js';
 
@@ -12,7 +13,7 @@ const KEEPALIVE_MS = 10_000;
 const REQUEST_MS = 45_000;
 const REQUESTS_PER_MINUTE = 120;
 
-type User = { name: string; files: AccountStorage };
+type User = { name: string; files: AccountStorage; connections: number };
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -171,14 +172,13 @@ async function main(): Promise<void> {
     await requirePrivateDirectory(directory);
     const files = new AccountStorage(directory);
     await files.initialize();
-    users.set(fingerprint, { name, files });
+    users.set(fingerprint, { name, files, connections: 0 });
   }
   if (users.size === 0) throw new Error('Configure at least one client certificate');
 
   const [key, cert, ca] = await Promise.all(
     [config.key, config.cert, config.ca].map((file: string) => readFile(resolve(base, file))),
   );
-  const active = new Set<string>();
   const server = createServer({
     key, cert, ca,
     minVersion: 'TLSv1.3',
@@ -188,12 +188,12 @@ async function main(): Promise<void> {
   }, (socket) => {
     socket.on('error', () => {});
     const user = users.get(socket.getPeerCertificate().fingerprint256);
-    if (!socket.authorized || !user || active.has(user.name)) {
+    if (!socket.authorized || !user || user.connections >= MAX_ACCOUNT_CONNECTIONS) {
       socket.destroy();
       return;
     }
-    active.add(user.name);
-    void serveSession(socket, user, ++lastSession).finally(() => active.delete(user.name));
+    user.connections += 1;
+    void serveSession(socket, user, ++lastSession).finally(() => { user.connections -= 1; });
   });
   let lastSession = 0;
   server.maxConnections = MAX_CONNECTIONS;

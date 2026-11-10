@@ -59,6 +59,9 @@ async function main(): Promise<void> {
   let socket: TLSSocket | undefined;
   let session: Session | undefined;
   let busy = false;
+  const transferSockets = new Set<TLSSocket>();
+  const activeTransfers = new Set<string>();
+  const transferLimit = 3;
   let origin = '';
   const connected = () => Boolean(socket && !socket.destroyed && session);
 
@@ -96,6 +99,43 @@ async function main(): Promise<void> {
     }
   }
 
+  async function withTransfer<T>(
+    key: string,
+    response: ServerResponse,
+    run: (worker: Session, signal: AbortSignal) => Promise<T>,
+  ): Promise<T> {
+    if (!connected()) throw new HttpError(503, '连接已断开，请重新连接');
+    if (activeTransfers.has(key) || activeTransfers.size >= transferLimit) {
+      throw new HttpError(409, '传输任务已在运行或达到并行上限');
+    }
+    activeTransfers.add(key);
+    const cancel = new AbortController();
+    response.once('close', () => cancel.abort());
+    const signal = AbortSignal.any([cancel.signal, shutdown.signal]);
+    let workerSocket: TLSSocket | undefined;
+    const stopWorker = () => workerSocket?.destroy();
+    signal.addEventListener('abort', stopWorker, { once: true });
+    try {
+      workerSocket = await connectClient(configPath, signal);
+      workerSocket.on('error', () => {});
+      transferSockets.add(workerSocket);
+      signal.throwIfAborted();
+      const worker = new Session(workerSocket);
+      await worker.exchange('ping');
+      const result = await run(worker, signal);
+      await worker.exchange('quit');
+      await closeSocket(workerSocket);
+      return result;
+    } finally {
+      signal.removeEventListener('abort', stopWorker);
+      if (workerSocket) {
+        workerSocket.destroy();
+        transferSockets.delete(workerSocket);
+      }
+      activeTransfers.delete(key);
+    }
+  }
+
   const server = createServer(async (request, response) => {
     response.setHeader('Cache-Control', 'no-store');
     response.setHeader('X-Content-Type-Options', 'nosniff');
@@ -123,8 +163,34 @@ async function main(): Promise<void> {
         json(response, 200, {
           connected: connected(), user: basename(configPath, '.json'),
           protocol: connected() ? socket?.getProtocol() : null,
-          peer: config.host + ':' + config.port, filesLimit: 16, maxBytes: MAX_PAYLOAD,
+          peer: config.host + ':' + config.port, filesLimit: 16, maxBytes: MAX_PAYLOAD, transferLimit,
         });
+        return;
+      }
+      const uploadResume = url.pathname === '/api/upload-resume' && request.method === 'POST';
+      const downloadResume = url.pathname === '/api/download-resume' && request.method === 'GET';
+      if (uploadResume || downloadResume) {
+        const name = url.searchParams.get('name');
+        if (!validName(name)) throw new HttpError(400, '文件名格式无效');
+        if (busy) throw new HttpError(409, '连接状态正在切换，请稍后重试');
+        if (uploadResume) {
+          const result = await withTransfer('upload:' + name, response, async (worker, signal) =>
+            uploadFile(worker, name, await body(request), signal));
+          json(response, 200, result);
+        } else {
+          const result = await withTransfer('download:' + name, response, async (worker, signal) => {
+            const checkpoint = await checkpointPath(name);
+            const result = await downloadFile(worker, name, checkpoint, signal);
+            await clearCheckpoint(checkpoint);
+            return result;
+          });
+          response.writeHead(200, {
+            'Content-Type': 'application/octet-stream', 'Content-Length': result.data.length,
+            'Content-Disposition': 'attachment; filename="' + name + '"',
+            'X-SFT-SHA256': result.sha256, 'X-SFT-Resumed-Bytes': result.resumedAt,
+          });
+          response.end(result.data);
+        }
         return;
       }
       if (busy) throw new HttpError(409, '当前操作进行中，请稍后重试');
@@ -136,6 +202,7 @@ async function main(): Promise<void> {
           return;
         }
         if (url.pathname === '/api/disconnect' && request.method === 'POST') {
+          if (activeTransfers.size) throw new HttpError(409, '请先暂停或完成正在传输的任务');
           await disconnect();
           json(response, 200, { ok: true });
           return;
@@ -148,28 +215,6 @@ async function main(): Promise<void> {
         }
         const name = url.searchParams.get('name');
         if (!validName(name)) throw new HttpError(400, '文件名请使用字母、数字、点、下划线或连字符，最长 64 字符');
-        if (url.pathname === '/api/upload-resume' && request.method === 'POST') {
-          const abort = new AbortController();
-          response.once('close', () => abort.abort());
-          const payload = await body(request);
-          const result = await uploadFile(session, name, payload, abort.signal);
-          json(response, 200, result);
-          return;
-        }
-        if (url.pathname === '/api/download-resume' && request.method === 'GET') {
-          const abort = new AbortController();
-          response.once('close', () => abort.abort());
-          const checkpoint = await checkpointPath(name);
-          const result = await downloadFile(session, name, checkpoint, abort.signal);
-          await clearCheckpoint(checkpoint);
-          response.writeHead(200, {
-            'Content-Type': 'application/octet-stream', 'Content-Length': result.data.length,
-            'Content-Disposition': 'attachment; filename="' + name + '"',
-            'X-SFT-SHA256': result.sha256, 'X-SFT-Resumed-Bytes': result.resumedAt,
-          });
-          response.end(result.data);
-          return;
-        }
         if (url.pathname === '/api/upload' && request.method === 'POST') {
           const payload = await body(request);
           const sha256 = digest(payload);
@@ -218,10 +263,12 @@ async function main(): Promise<void> {
       console.log('UI ' + origin + '/#token=' + token);
     }
   });
+  let pingPending = false;
   const heartbeat = setInterval(() => {
-    if (busy || !connected() || !session) return;
-    busy = true;
-    session.exchange('ping').catch(() => socket?.destroy()).finally(() => { busy = false; });
+    if (busy || pingPending || !connected() || !session) return;
+    const current = socket;
+    pingPending = true;
+    session.exchange('ping').catch(() => current?.destroy()).finally(() => { pingPending = false; });
   }, 15_000);
   heartbeat.unref();
   for (const signal of ['SIGINT', 'SIGTERM'] as const) {
@@ -230,6 +277,7 @@ async function main(): Promise<void> {
       shutdown.abort();
       clearInterval(heartbeat);
       socket?.destroy();
+      for (const worker of transferSockets) worker.destroy();
       server.close();
       server.closeAllConnections();
     });

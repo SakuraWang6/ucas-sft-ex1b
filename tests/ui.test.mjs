@@ -257,6 +257,47 @@ test('browser adapter resumes a staged upload and verifies the downloaded file',
   }
 });
 
+test('the same browser account uploads two files while downloading a third', async () => {
+  await session('connect');
+  const payload = Buffer.from('overlapping transfers');
+  const gate = Promise.withResolvers();
+  const running = [];
+  try {
+    await put('parallel-source.bin', payload);
+    const start = server.stdout.length;
+    for (const name of ['parallel-first.bin', 'parallel-second.bin']) {
+      const body = new ReadableStream({
+        async start(controller) {
+          controller.enqueue(payload.subarray(0, 1));
+          await gate.promise;
+          controller.enqueue(payload.subarray(1));
+          controller.close();
+        },
+      });
+      running.push(apiJson(`upload-resume?name=${name}`, {
+        method: 'POST', body, duplex: 'half', headers: { 'Content-Length': String(payload.length) },
+      }));
+    }
+    const uploads = Promise.all(running);
+    void uploads.catch(() => {});
+    // Both TLS task connections must be open while their upload bodies are paused.
+    await waitForOutput(server, /SESSION \d+ OPEN alice TLSv1\.3[\s\S]*SESSION \d+ OPEN alice TLSv1\.3/, start);
+    await apiJson('disconnect', { method: 'POST' }, 409);
+    const response = await api('download-resume?name=parallel-source.bin');
+    assert.equal(response.status, 200);
+    assert.deepEqual(Buffer.from(await response.arrayBuffer()), payload);
+    gate.resolve();
+    assert.deepEqual((await uploads).map(file => file.name), ['parallel-first.bin', 'parallel-second.bin']);
+    const { files } = await apiJson('files');
+    assert.ok(files.some(file => file.name === 'parallel-first.bin'));
+    assert.ok(files.some(file => file.name === 'parallel-second.bin'));
+  } finally {
+    gate.resolve();
+    await Promise.allSettled(running);
+    await session('disconnect');
+  }
+});
+
 for (const stage of ['TLS handshake', 'application authorization ping']) {
   test(`bridge shutdown closes an in-flight ${stage}`, {
     timeout: 7000,

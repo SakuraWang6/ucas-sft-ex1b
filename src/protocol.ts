@@ -6,6 +6,7 @@ const PREFIX_BYTES = 12;
 const MAX_HEADER = 4096;
 export const MAX_PAYLOAD = 8 * 1024 * 1024;
 export const CHUNK_BYTES = 512 * 1024;
+export const MAX_ACCOUNT_CONNECTIONS = 4;
 
 type Header = Record<string, unknown>;
 export type Frame = { header: Header; payload: Buffer };
