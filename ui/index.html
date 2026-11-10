@@ -22,7 +22,7 @@
     <div class="site-header-inner">
       <div class="brand">
         <span class="brand-icon" aria-hidden="true"><svg class="icon"><use href="#icon-transfer"/></svg></span>
-        <span class="brand-title">SFT <span>／</span> 文件工作台</span>
+        <span class="brand-title">SFT <span aria-hidden="true"></span> 文件工作台</span>
       </div>
       <span class="site-label"><span aria-hidden="true"></span> 本机控制台</span>
     </div>
@@ -33,7 +33,7 @@
       <div class="introduction">
         <p class="eyebrow"><span></span> 软件与系统安全 <b>·</b> 实验 1B</p>
         <h1 id="page-title">安全文件传输台</h1>
-        <p class="intro-text">在持续的 TLS 会话中管理当前账号的文件。传输记录展示 SHA-256 校验值。</p>
+        <p class="intro-text">管理当前账号的远端文件，并在传输完成后核对 SHA-256。</p>
       </div>
       <section class="connection" aria-labelledby="connection-title">
         <div class="connection-head">
@@ -61,9 +61,14 @@
             <p class="panel-index">01 / FILES</p>
             <h2 id="files-title">远端文件</h2>
           </div>
-          <button type="button" class="quiet-button" id="refresh-files" disabled>
-            <svg class="icon" aria-hidden="true"><use href="#icon-refresh"/></svg> 刷新列表
-          </button>
+          <div class="panel-actions">
+            <button type="button" class="quiet-button" id="refresh-files" disabled>
+              <svg class="icon" aria-hidden="true"><use href="#icon-refresh"/></svg> 刷新列表
+            </button>
+            <button type="button" class="quiet-button batch-button" id="download-selected" disabled>
+              <svg class="icon" aria-hidden="true"><use href="#icon-download"/></svg> 下载所选
+            </button>
+          </div>
         </div>
         <div class="file-summary" id="file-summary" role="status">等待读取当前账号目录</div>
         <div class="file-state" id="file-state">
@@ -85,7 +90,7 @@
         <div class="drop-zone" id="drop-zone" aria-describedby="upload-instructions">
           <span class="drop-icon" aria-hidden="true"><svg class="icon"><use href="#icon-upload"/></svg></span>
           <button type="button" class="primary-button" id="choose-files" disabled>选择文件</button>
-          <span id="upload-instructions">也可拖放文件，多选时顺序处理</span>
+          <span id="upload-instructions">也可将一个或多个文件拖到这里</span>
           <input type="file" id="upload-input" aria-label="选择要上传的文件" multiple hidden disabled>
         </div>
         <label class="name-field" for="upload-name">
@@ -94,6 +99,7 @@
         </label>
         <p class="field-hint" id="name-hint">使用英文字母、数字或 <code>._-</code>，以字母或数字开头。</p>
         <p class="queue-status" id="queue-status" role="status" hidden></p>
+        <ol class="transfer-queue" id="upload-queue" aria-label="上传队列"></ol>
       </section>
     </div>
 
