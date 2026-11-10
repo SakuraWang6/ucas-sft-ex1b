@@ -3,11 +3,15 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "engines": { "node": ">=24" },
+  "engines": {
+    "node": ">=24"
+  },
   "scripts": {
     "build": "tsc",
     "setup": "node scripts/setup.mjs",
-    "test": "node --test tests/*.test.mjs"
+    "test": "node --test tests/*.test.mjs",
+    "start": "node dist/server.js runtime/server.json",
+    "ui": "node dist/ui.js runtime/alice.json"
   },
   "devDependencies": {
     "@types/node": "24.13.3",
