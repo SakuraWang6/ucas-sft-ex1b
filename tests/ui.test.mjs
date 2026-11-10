@@ -12,7 +12,9 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { createServer as createTlsServer } from 'node:tls';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
-import { FrameReader, MAX_PAYLOAD } from '../dist/protocol.js';
+import { CHUNK_BYTES, FrameReader, MAX_PAYLOAD } from '../dist/protocol.js';
+
+import { connectClient, Session, closeSocket } from '../dist/session.js';
 
 const project = fileURLToPath(new URL('../', import.meta.url));
 const execNode = promisify(execFile);
@@ -223,6 +225,33 @@ test('browser API rejects duplicate, missing, invalid-name and oversized file op
     assert.deepEqual(Buffer.from(await download.arrayBuffer()), original);
     const { files } = await apiJson('files');
     assert.ok(!files.some(file => file.name === 'too-large.bin' || file.name === 'invalid name.bin'));
+  } finally {
+    await session('disconnect');
+  }
+});
+
+test('browser adapter resumes a staged upload and verifies the downloaded file', async () => {
+  const name = 'ui-resume.bin';
+  const data = Buffer.alloc(CHUNK_BYTES + 9, 127);
+  const sha256 = createHash('sha256').update(data).digest('hex');
+  const socket = await connectClient(join(runtime, 'alice.json'));
+  try {
+    const direct = new Session(socket);
+    await direct.exchange('put-begin', { name, bytes: data.length, sha256 });
+    await direct.exchange('put-chunk', { name, offset: 0, sha256 }, data.subarray(0, CHUNK_BYTES));
+    await direct.exchange('quit');
+    await closeSocket(socket);
+  } finally {
+    socket.destroy();
+  }
+  await session('connect');
+  try {
+    const reply = await apiJson(`upload-resume?name=${name}`, { method: 'POST', body: data });
+    assert.deepEqual(reply, { name, bytes: data.length, sha256, resumedAt: CHUNK_BYTES });
+    const received = await api(`download-resume?name=${name}`);
+    assert.equal(received.status, 200);
+    assert.equal(received.headers.get('x-sft-sha256'), sha256);
+    assert.deepEqual(Buffer.from(await received.arrayBuffer()), data);
   } finally {
     await session('disconnect');
   }

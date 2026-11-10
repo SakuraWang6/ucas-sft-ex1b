@@ -1,10 +1,11 @@
 import { randomBytes } from 'node:crypto';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import { readFile } from 'node:fs/promises';
-import { basename } from 'node:path';
+import { lstat, mkdir, readFile } from 'node:fs/promises';
+import { basename, dirname, join, resolve } from 'node:path';
 import type { TLSSocket } from 'node:tls';
 import { connectClient, Session, closeSocket } from './session.js';
 import { digest, MAX_PAYLOAD, validName } from './protocol.js';
+import { clearCheckpoint, downloadFile, uploadFile } from './transfer.js';
 
 class HttpError extends Error {
   constructor(readonly status: number, message: string) { super(message); }
@@ -34,6 +35,15 @@ function json(response: ServerResponse, status: number, data: unknown): void {
 async function main(): Promise<void> {
   const configPath = process.argv[2];
   if (!configPath || process.argv.length !== 3) throw new Error('Usage: node dist/ui.js <client.json>');
+  const cacheDir = join(dirname(resolve(configPath)), '.sft-download-' + basename(configPath, '.json'));
+  async function checkpointPath(name: string) {
+    await mkdir(cacheDir, { mode: 0o700 }).catch(error => {
+      if (error.code !== 'EEXIST') throw error;
+    });
+    const info = await lstat(cacheDir);
+    if (!info.isDirectory() || (info.mode & 0o077) !== 0) throw new Error('下载缓存必须是私有目录');
+    return join(cacheDir, digest(Buffer.from(name)) + '.part');
+  }
   const config = JSON.parse(await readFile(configPath, 'utf8'));
   const token = randomBytes(32).toString('hex');
   const assets = new Map(await Promise.all([
@@ -138,6 +148,28 @@ async function main(): Promise<void> {
         }
         const name = url.searchParams.get('name');
         if (!validName(name)) throw new HttpError(400, '文件名请使用字母、数字、点、下划线或连字符，最长 64 字符');
+        if (url.pathname === '/api/upload-resume' && request.method === 'POST') {
+          const abort = new AbortController();
+          response.once('close', () => abort.abort());
+          const payload = await body(request);
+          const result = await uploadFile(session, name, payload, abort.signal);
+          json(response, 200, result);
+          return;
+        }
+        if (url.pathname === '/api/download-resume' && request.method === 'GET') {
+          const abort = new AbortController();
+          response.once('close', () => abort.abort());
+          const checkpoint = await checkpointPath(name);
+          const result = await downloadFile(session, name, checkpoint, abort.signal);
+          await clearCheckpoint(checkpoint);
+          response.writeHead(200, {
+            'Content-Type': 'application/octet-stream', 'Content-Length': result.data.length,
+            'Content-Disposition': 'attachment; filename="' + name + '"',
+            'X-SFT-SHA256': result.sha256, 'X-SFT-Resumed-Bytes': result.resumedAt,
+          });
+          response.end(result.data);
+          return;
+        }
         if (url.pathname === '/api/upload' && request.method === 'POST') {
           const payload = await body(request);
           const sha256 = digest(payload);

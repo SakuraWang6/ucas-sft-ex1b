@@ -238,6 +238,10 @@ async function sha256(data) {
   return Array.from(digest, (byte) => byte.toString(16).padStart(2, '0')).join('');
 }
 
+function verifiedDigest(hash, resumedAt) {
+  return `SHA-256  ${hash}${resumedAt > 0 ? ` · 从 ${formatBytes(resumedAt)} 续传` : ''}`;
+}
+
 function upload(selectedFiles) {
   if (busy || !session?.connected || !selectedFiles.length) return;
   const override = nameInput.value.trim();
@@ -258,7 +262,7 @@ function upload(selectedFiles) {
           if (!validName(name)) throw new Error('请指定合法的远端名称后重试。');
           if (file.size > session.maxBytes) throw new Error(`文件超过 ${formatBytes(session.maxBytes)} 上限。`);
           const hash = await sha256(await file.arrayBuffer());
-          const result = await json(`upload?name=${encodeURIComponent(name)}`, {
+          const result = await json(`upload-resume?name=${encodeURIComponent(name)}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/octet-stream' },
             body: file,
@@ -266,7 +270,7 @@ function upload(selectedFiles) {
           if (result.name !== name || result.bytes !== file.size || result.sha256 !== hash) {
             throw new Error('上传回执与本地文件校验值不一致。');
           }
-          finish('success', `SHA-256  ${hash}`);
+          finish('success', verifiedDigest(hash, result.resumedAt));
           succeeded += 1;
         } catch (error) {
           finish('error', errorText(error));
@@ -285,7 +289,7 @@ async function download(name, size) {
   await operate('download', async () => {
     const finish = logTransfer('下载', name, size);
     try {
-      const response = await request(`download?name=${encodeURIComponent(name)}`);
+      const response = await request(`download-resume?name=${encodeURIComponent(name)}`);
       const bytes = await response.arrayBuffer();
       const hash = await sha256(bytes);
       if (hash !== response.headers.get('X-SFT-SHA256') || bytes.byteLength !== size) {
@@ -299,7 +303,7 @@ async function download(name, size) {
       link.click();
       link.remove();
       setTimeout(() => URL.revokeObjectURL(url), 5000);
-      finish('success', `SHA-256  ${hash}`);
+      finish('success', verifiedDigest(hash, Number(response.headers.get('X-SFT-Resumed-Bytes'))));
     } catch (error) {
       finish('error', errorText(error));
       throw error;

@@ -12,7 +12,7 @@ import { setImmediate, setTimeout as delay } from 'node:timers/promises';
 import { connect } from 'node:tls';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
-import { FrameReader, MAX_PAYLOAD, writeFrame } from '../dist/protocol.js';
+import { CHUNK_BYTES, FrameReader, MAX_PAYLOAD, writeFrame } from '../dist/protocol.js';
 
 const project = fileURLToPath(new URL('../', import.meta.url));
 const execNode = promisify(execFile);
@@ -301,8 +301,8 @@ function waitForClose(socket, timeout = 3000) {
   });
 }
 
-async function openPeer(t, name) {
-  const socket = connect(await peerOptions(name));
+async function openPeer(t, name, options = {}) {
+  const socket = connect({ ...await peerOptions(name), ...options });
   socket.on('error', () => {});
   t.after(() => socket.destroy());
   await once(socket, 'secureConnect', { signal: AbortSignal.timeout(3000) });
@@ -339,6 +339,86 @@ async function requireRejectedPeer(options) {
     socket.destroy();
   }
 }
+
+test('resumable upload survives server restart and a ranged download survives reconnection', {
+  timeout: 10000,
+}, async t => {
+  const config = JSON.parse(await readFile(join(runtime, 'server.json'), 'utf8'));
+  config.dataDir = 'restart-storage';
+  config.users = { alice: config.users.alice };
+  const directory = join(runtime, config.dataDir);
+  await mkdir(directory, { mode: 0o700 });
+  await mkdir(join(directory, 'alice'), { mode: 0o700 });
+  const configPath = join(runtime, 'restart-server.json');
+  await writeFile(configPath, JSON.stringify(config));
+  const startServer = async () => {
+    const child = launch(['dist/server.js', configPath], 0);
+    child.child.stdin.end();
+    t.after(async () => { child.child.kill('SIGTERM'); await child.done; });
+    const [, listen] = await waitForOutput(child, /^LISTEN 127\.0\.0\.1:(\d+)$/m);
+    return { child, port: Number(listen) };
+  };
+
+  const payload = Buffer.alloc(CHUNK_BYTES + 91).fill(Buffer.from([0, 128, 255, 31]));
+  const sha256 = createHash('sha256').update(payload).digest('hex');
+  const file = { name: 'resume.bin', sha256 };
+  const begin = { op: 'put-begin', ...file, bytes: payload.length };
+  const chunk = { op: 'put-chunk', ...file };
+  const finish = { op: 'put-finish', ...file };
+  const first = await startServer();
+  const interrupted = await openPeer(t, 'alice', { port: first.port });
+  assert.deepEqual((await exchange(interrupted, begin)).header, { ...begin, status: 'ok', offset: 0, complete: false });
+  assert.equal((await exchange(interrupted, { ...chunk, offset: 0 }, payload.subarray(0, CHUNK_BYTES))).header.offset, CHUNK_BYTES);
+  assert.deepEqual((await exchange(interrupted, { op: 'list' })).header.files, []);
+  const overlapping = await exchange(interrupted, { ...chunk, offset: 0 }, Buffer.from([1]));
+  assert.equal(overlapping.header.message, 'Upload offset does not match');
+  assert.equal((await exchange(interrupted, finish)).header.message, 'Upload is incomplete');
+  first.child.child.kill('SIGTERM');
+  await first.child.done;
+  interrupted.socket.destroy();
+
+  const restarted = await startServer();
+  const resumed = await openPeer(t, 'alice', { port: restarted.port });
+  const checkpoint = await exchange(resumed, begin);
+  assert.equal(checkpoint.header.offset, CHUNK_BYTES);
+  assert.equal(checkpoint.header.complete, false);
+  assert.equal((await exchange(resumed, { ...chunk, offset: CHUNK_BYTES }, payload.subarray(CHUNK_BYTES))).header.offset, payload.length);
+  assert.deepEqual((await exchange(resumed, finish)).header, { ...finish, status: 'ok', bytes: payload.length });
+  assert.deepEqual((await exchange(resumed, begin)).header, { ...begin, status: 'ok', offset: payload.length, complete: true });
+  assert.equal((await exchange(resumed, { ...begin, sha256: '0'.repeat(64) })).header.message, 'File already exists');
+  const info = await exchange(resumed, { op: 'get-info', name: file.name });
+  assert.deepEqual(info.header, { op: 'get-info', ...file, status: 'ok', bytes: payload.length });
+  const part1 = await exchange(resumed, { op: 'get-chunk', ...file, offset: 0, bytes: CHUNK_BYTES });
+  await quitPeer(resumed);
+
+  const download = await openPeer(t, 'alice', { port: restarted.port });
+  const changed = await exchange(download, { op: 'get-chunk', ...file, sha256: '0'.repeat(64), offset: CHUNK_BYTES, bytes: 91 });
+  assert.equal(changed.header.message, 'File changed since download began');
+  const part2 = await exchange(download, { op: 'get-chunk', ...file, offset: CHUNK_BYTES, bytes: 91 });
+  assert.equal(part2.header.offset, CHUNK_BYTES);
+  assert.deepEqual(Buffer.concat([part1.payload, part2.payload]), payload);
+  assert.deepEqual(await readFile(join(directory, 'alice', file.name)), payload);
+  await quitPeer(download);
+});
+
+test('resumable upload discards incorrect content and accepts a zero-byte file', {
+  timeout: 8000,
+}, async t => {
+  const peer = await openPeer(t, 'alice');
+  const name = 'failed-checkpoint.bin';
+  const payload = Buffer.from([1, 2, 3]);
+  const sha256 = createHash('sha256').update(payload).digest('hex');
+  const file = { name, sha256 };
+  assert.equal((await exchange(peer, { op: 'put-begin', ...file, bytes: payload.length })).header.offset, 0);
+  assert.equal((await exchange(peer, { op: 'put-chunk', ...file, offset: 0 }, Buffer.from([4, 5, 6]))).header.status, 'ok');
+  assert.equal((await exchange(peer, { op: 'put-finish', ...file })).header.message, 'File digest mismatch');
+  assert.equal((await exchange(peer, { op: 'get-info', name })).header.message, 'File is unavailable');
+  const empty = { name, sha256: createHash('sha256').digest('hex') };
+  assert.equal((await exchange(peer, { op: 'put-begin', ...empty, bytes: 0 })).header.offset, 0);
+  assert.equal((await exchange(peer, { op: 'put-finish', ...empty })).header.bytes, 0);
+  assert.equal((await exchange(peer, { op: 'get-info', name })).header.sha256, empty.sha256);
+  await quitPeer(peer);
+});
 
 test('CLI round trips zero bytes and exactly 8 MiB, rejecting a local file one byte larger', async () => {
   const empty = join(root, 'empty.input');

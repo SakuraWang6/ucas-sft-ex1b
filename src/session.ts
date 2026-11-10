@@ -72,7 +72,7 @@ export class Session {
         if (
           !response || response.header.op !== op ||
           (response.header.status !== 'ok' && response.header.status !== 'error') ||
-          ((op !== 'get' || response.header.status !== 'ok') && response.payload.length !== 0)
+          ((!['get', 'get-chunk'].includes(op) || response.header.status !== 'ok') && response.payload.length !== 0)
         ) {
           this.socket.destroy();
           throw new Error('Missing or invalid server response.');

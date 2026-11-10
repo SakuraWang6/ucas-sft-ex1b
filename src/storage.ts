@@ -1,12 +1,29 @@
 import { constants } from 'node:fs';
-import { link, lstat, open, readdir, unlink } from 'node:fs/promises';
-import { randomUUID } from 'node:crypto';
+import { link, lstat, mkdir, open, readdir, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
-import { MAX_PAYLOAD, validName } from './protocol.js';
+import { digest, MAX_PAYLOAD, validDigest, validName } from './protocol.js';
 
 const MAX_FILES = 16;
+const SAFE_OPEN = (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0);
+
+type PartialFile = { path: string; name: string; bytes: number; sha256: string };
+type FileInfo = Pick<PartialFile, 'name' | 'bytes' | 'sha256'>;
+type UploadProgress = FileInfo & { offset: number; complete: boolean };
 
 export class RequestError extends Error {}
+
+function errorCode(error: unknown): string | undefined {
+  return (error as NodeJS.ErrnoException).code;
+}
+
+async function existing(path: string) {
+  try {
+    return await lstat(path);
+  } catch (error) {
+    if (errorCode(error) === 'ENOENT') return undefined;
+    throw error;
+  }
+}
 
 export async function requirePrivateDirectory(path: string): Promise<void> {
   const stat = await lstat(path);
@@ -18,46 +35,10 @@ export async function requirePrivateDirectory(path: string): Promise<void> {
   }
 }
 
-export async function listFiles(directory: string): Promise<{ name: string; bytes: number }[]> {
-  const entries = await readdir(directory, { withFileTypes: true });
-  const files = [];
-  for (const entry of entries) {
-    if (!entry.isFile() || !validName(entry.name)) continue;
-    const stat = await lstat(join(directory, entry.name));
-    if (stat.isFile() && stat.size <= MAX_PAYLOAD) files.push({ name: entry.name, bytes: stat.size });
-  }
-  return files.sort((a, b) => a.name.localeCompare(b.name)).slice(0, MAX_FILES);
-}
-
-export async function storeFile(directory: string, name: string, payload: Buffer): Promise<void> {
-  // One authenticated session per user serializes updates to this private directory.
-  if ((await readdir(directory)).length >= MAX_FILES) throw new RequestError('Storage is full');
-  const temporary = join(directory, '.part-' + randomUUID());
-  const file = await open(temporary, 'wx', 0o600);
-  try {
-    try {
-      await file.writeFile(payload);
-    } finally {
-      await file.close();
-    }
-    // Link commits a complete file and fails atomically if the name already exists.
-    await link(temporary, join(directory, name));
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'EEXIST') throw new RequestError('File already exists');
-    throw error;
-  } finally {
-    await unlink(temporary).catch((error: NodeJS.ErrnoException) => {
-      console.error('Could not remove staging file:', error.code);
-    });
-  }
-}
-
-export async function loadFile(directory: string, name: string): Promise<Buffer> {
-  const path = join(directory, name);
+async function loadFile(path: string): Promise<Buffer> {
   try {
     if (!(await lstat(path)).isFile()) throw new RequestError('File is unavailable');
-    const flags = constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0);
-    const handle = await open(path, flags);
+    const handle = await open(path, constants.O_RDONLY | SAFE_OPEN);
     try {
       const stat = await handle.stat();
       if (!stat.isFile() || stat.size > MAX_PAYLOAD) {
@@ -79,8 +60,214 @@ export async function loadFile(directory: string, name: string): Promise<Buffer>
       await handle.close();
     }
   } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
+    const code = errorCode(error);
     if (code === 'ENOENT' || code === 'ELOOP') throw new RequestError('File is unavailable');
     throw error;
+  }
+}
+
+async function discard(path: string): Promise<void> {
+  try {
+    await unlink(path);
+  } catch (error) {
+    if (errorCode(error) !== 'ENOENT') console.error('Could not remove staging file:', errorCode(error));
+  }
+}
+
+async function partialOffset(partial: PartialFile): Promise<number> {
+  const stat = await lstat(partial.path);
+  if (!stat.isFile() || stat.size > partial.bytes) throw new RequestError('Upload staging file is invalid');
+  return stat.size;
+}
+
+async function append(partial: PartialFile, offset: number, payload: Buffer): Promise<number> {
+  if (offset + payload.length > partial.bytes) throw new RequestError('Chunk exceeds declared file length');
+  await partialOffset(partial);
+  const handle = await open(partial.path, constants.O_WRONLY | SAFE_OPEN);
+  try {
+    const stat = await handle.stat();
+    if (!stat.isFile() || stat.nlink !== 1) throw new RequestError('Upload staging file is invalid');
+    if (stat.size !== offset) throw new RequestError('Upload offset does not match');
+    let written = 0;
+    while (written < payload.length) {
+      const { bytesWritten } = await handle.write(payload, written, payload.length - written, offset + written);
+      if (bytesWritten === 0) throw new Error('Could not write upload chunk');
+      written += bytesWritten;
+    }
+    await handle.sync();
+    return offset + written;
+  } finally {
+    await handle.close();
+  }
+}
+
+export class AccountStorage {
+  private readonly staging: string;
+  private readonly activeFiles = new Set<string>();
+  private metadata = Promise.resolve();
+
+  constructor(private readonly directory: string) {
+    this.staging = join(directory, '.sft-partial');
+  }
+
+  async initialize(): Promise<void> {
+    await mkdir(this.staging, { mode: 0o700 }).catch(error => {
+      if (errorCode(error) !== 'EEXIST') throw error;
+    });
+    await requirePrivateDirectory(this.staging);
+  }
+
+  async list(): Promise<{ name: string; bytes: number }[]> {
+    const entries = await readdir(this.directory, { withFileTypes: true });
+    const files = [];
+    for (const entry of entries) {
+      if (!entry.isFile() || !validName(entry.name)) continue;
+      const stat = await existing(join(this.directory, entry.name));
+      if (stat?.isFile() && stat.size <= MAX_PAYLOAD) files.push({ name: entry.name, bytes: stat.size });
+    }
+    return files.sort((a, b) => a.name.localeCompare(b.name)).slice(0, MAX_FILES);
+  }
+
+  load(name: string): Promise<Buffer> {
+    return loadFile(join(this.directory, name));
+  }
+
+  store(name: string, payload: Buffer, sha256: string): Promise<void> {
+    return this.exclusive(name, async () => {
+      const partial = await this.createPartial({ name, bytes: payload.length, sha256 });
+      try {
+        if (payload.length) await append(partial, 0, payload);
+        await this.publish(partial);
+      } finally {
+        await discard(partial.path);
+      }
+    });
+  }
+
+  begin(info: FileInfo): Promise<UploadProgress> {
+    return this.exclusive(info.name, async () => {
+      const complete = await this.completed(info.name, info.sha256);
+      if (complete) {
+        if (complete.bytes !== info.bytes) throw new RequestError('File already exists');
+        return { ...complete, offset: complete.bytes, complete: true };
+      }
+      const partial = await this.findPartial(info.name) ?? await this.createPartial(info);
+      if (partial.sha256 !== info.sha256 || partial.bytes !== info.bytes) {
+        throw new RequestError('Upload already in progress with different file metadata');
+      }
+      return { ...info, offset: await partialOffset(partial), complete: false };
+    });
+  }
+
+  append(name: string, sha256: string, offset: number, payload: Buffer): Promise<number> {
+    return this.exclusive(name, async () => {
+      const partial = await this.requirePartial(name, sha256);
+      return append(partial, offset, payload);
+    });
+  }
+
+  finish(name: string, sha256: string): Promise<FileInfo> {
+    return this.exclusive(name, async () => {
+      const complete = await this.completed(name, sha256);
+      if (complete) return complete;
+      const partial = await this.requirePartial(name, sha256);
+      if (await partialOffset(partial) !== partial.bytes) throw new RequestError('Upload is incomplete');
+      const payload = await loadFile(partial.path);
+      if (payload.length !== partial.bytes || digest(payload) !== sha256) {
+        await discard(partial.path);
+        throw new RequestError('File digest mismatch');
+      }
+      await this.publish(partial);
+      return { name, bytes: partial.bytes, sha256 };
+    });
+  }
+
+  private async exclusive<T>(name: string, work: () => Promise<T>): Promise<T> {
+    const key = name.toLowerCase();
+    if (this.activeFiles.has(key)) throw new RequestError('File is busy');
+    this.activeFiles.add(key);
+    try {
+      return await work();
+    } finally {
+      this.activeFiles.delete(key);
+    }
+  }
+
+  private updateMetadata<T>(work: () => Promise<T>): Promise<T> {
+    const result = this.metadata.then(work);
+    this.metadata = result.then(() => undefined, () => undefined);
+    return result;
+  }
+
+  private async partials(): Promise<PartialFile[]> {
+    const entries = await readdir(this.staging);
+    const partials: PartialFile[] = [];
+    for (const entry of entries) {
+      const match = /^(.+)\.([0-9]{1,7})\.([a-f0-9]{64})$/.exec(entry);
+      if (!match) continue;
+      const [, name, length, sha256] = match;
+      const bytes = Number(length);
+      if (validName(name) && bytes <= MAX_PAYLOAD) {
+        partials.push({ path: join(this.staging, entry), name, bytes, sha256 });
+      }
+    }
+    return partials;
+  }
+
+  private async findPartial(name: string): Promise<PartialFile | undefined> {
+    const matches = (await this.partials()).filter(file => file.name.toLowerCase() === name.toLowerCase());
+    if (matches.length > 1 || (matches[0] && matches[0].name !== name)) {
+      throw new RequestError('Upload already in progress for this name');
+    }
+    return matches[0];
+  }
+
+  private async requirePartial(name: string, sha256: string): Promise<PartialFile> {
+    const partial = await this.findPartial(name);
+    if (!partial || partial.sha256 !== sha256) throw new RequestError('Matching upload has not begun');
+    return partial;
+  }
+
+  private createPartial(info: FileInfo): Promise<PartialFile> {
+    return this.updateMetadata(async () => {
+      const names = new Set((await readdir(this.directory)).filter(validName).map(name => name.toLowerCase()));
+      const key = info.name.toLowerCase();
+      if (names.has(key)) throw new RequestError('File already exists');
+      for (const partial of await this.partials()) {
+        if (partial.name.toLowerCase() === key) throw new RequestError('Upload already in progress for this name');
+        names.add(partial.name.toLowerCase());
+      }
+      if (names.size >= MAX_FILES) throw new RequestError('Storage is full');
+      // Metadata in the pathname makes initialization a single atomic create.
+      const path = join(this.staging, `${info.name}.${info.bytes}.${info.sha256}`);
+      const file = await open(path, 'wx', 0o600);
+      await file.close();
+      return { ...info, path };
+    });
+  }
+
+  private async completed(name: string, sha256: string): Promise<FileInfo | undefined> {
+    const path = join(this.directory, name);
+    const stat = await existing(path);
+    if (!stat) return undefined;
+    if (!stat.isFile() || stat.size > MAX_PAYLOAD) throw new RequestError('File already exists');
+    const payload = await loadFile(path);
+    if (!validDigest(sha256) || digest(payload) !== sha256) throw new RequestError('File already exists');
+    const partial = await this.findPartial(name);
+    if (partial?.sha256 === sha256 && partial.bytes === payload.length) await discard(partial.path);
+    return { name, bytes: payload.length, sha256 };
+  }
+
+  private publish(partial: PartialFile): Promise<void> {
+    return this.updateMetadata(async () => {
+      try {
+        // This link exposes the complete file atomically and cannot overwrite an existing file.
+        await link(partial.path, join(this.directory, partial.name));
+      } catch (error) {
+        if (errorCode(error) === 'EEXIST') throw new RequestError('File already exists');
+        throw error;
+      }
+      await discard(partial.path);
+    });
   }
 }

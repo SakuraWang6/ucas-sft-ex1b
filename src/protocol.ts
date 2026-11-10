@@ -5,12 +5,17 @@ const MAGIC = Buffer.from('SFT1', 'ascii');
 const PREFIX_BYTES = 12;
 const MAX_HEADER = 4096;
 export const MAX_PAYLOAD = 8 * 1024 * 1024;
+export const CHUNK_BYTES = 512 * 1024;
 
 type Header = Record<string, unknown>;
 export type Frame = { header: Header; payload: Buffer };
 
 export function digest(payload: Buffer): string {
   return createHash('sha256').update(payload).digest('hex');
+}
+
+export function validDigest(value: unknown): value is string {
+  return typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
 }
 
 export function validName(name: unknown): name is string {

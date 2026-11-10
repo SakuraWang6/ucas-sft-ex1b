@@ -6,7 +6,9 @@ import { createInterface } from 'node:readline';
 import { digest, MAX_PAYLOAD, validName } from './protocol.js';
 
 import { connectClient, Session, closeSocket } from './session.js';
+import { clearCheckpoint, downloadFile, uploadFile } from './transfer.js';
 const PING_INTERVAL_MS = 15_000;
+const COMMANDS = 'Commands: list | put <local-file> [name] | get <name> [local-file] | put-resume <local-file> [name] | get-resume <name> [local-file] | quit';
 
 function parseCommand(line: string): string[] {
   const text = line.trim();
@@ -89,18 +91,33 @@ async function execute(session: Session, [op, first, second, ...extra]: string[]
     console.log([`LIST ${rows.length}`, ...rows].join('\n'));
     return false;
   }
-  if (op === 'put' && first && extra.length === 0) {
+  if ((op === 'put' || op === 'put-resume') && first && extra.length === 0) {
     const name = second ?? basename(first);
     if (!validName(name)) {
       throw new Error('Choose a valid remote filename.');
     }
     const data = await readUpload(first);
+    if (op === 'put-resume') {
+      const result = await uploadFile(session, name, data);
+      console.log(`PUT ${name} ${result.bytes} bytes SHA-256 ${result.sha256} RESUMED ${result.resumedAt}`);
+      return false;
+    }
     const sha256 = digest(data);
     const { header } = await session.exchange(op, { name, sha256 }, data);
     if (header.name !== name || header.bytes !== data.length || header.sha256 !== sha256) {
       throw new Error('The upload acknowledgement did not match the file.');
     }
     console.log(`PUT ${name} ${data.length} bytes SHA-256 ${sha256}`);
+    return false;
+  }
+  if (op === 'get-resume' && validName(first) && second !== '' && extra.length === 0) {
+    const target = resolve(second ?? first);
+    const key = digest(Buffer.from(JSON.stringify([target, first])));
+    const checkpoint = join(dirname(target), `.sft-download-${key}.part`);
+    const result = await downloadFile(session, first, checkpoint);
+    await saveDownload(target, result.data);
+    await clearCheckpoint(checkpoint);
+    console.log(`GET ${first} ${result.data.length} bytes SHA-256 ${result.sha256} RESUMED ${result.resumedAt}`);
     return false;
   }
   if (op === 'get' && validName(first) && second !== '' && extra.length === 0) {
@@ -113,7 +130,7 @@ async function execute(session: Session, [op, first, second, ...extra]: string[]
     console.log(`GET ${first} ${payload.length} bytes SHA-256 ${sha256}`);
     return false;
   }
-  throw new Error('Commands: list | put <local-file> [name] | get <name> [local-file] | quit');
+  throw new Error(COMMANDS);
 }
 
 function reportError(error: unknown): void {
@@ -166,7 +183,7 @@ async function main(): Promise<void> {
   }, PING_INTERVAL_MS);
   console.log(`CONNECTED ${socket.getProtocol()}`);
   if (interactive) {
-    console.log('Commands: list | put <local-file> [name] | get <name> [local-file] | quit');
+    console.log(COMMANDS);
     input.prompt();
   }
 
