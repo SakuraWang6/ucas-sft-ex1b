@@ -171,6 +171,7 @@ test('browser API can connect, disconnect and reconnect as the configured accoun
       assert.equal(status.user, 'alice');
       assert.equal(status.protocol, 'TLSv1.3');
       assert.equal(status.maxBytes, MAX_PAYLOAD);
+      assert.equal(status.bandwidthBytesPerSecond, 8 * 1024 * 1024);
     } finally {
       assert.deepEqual(await session('disconnect'), { ok: true });
     }

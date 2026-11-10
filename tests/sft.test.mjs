@@ -621,6 +621,72 @@ test('server startup validates account name, fingerprint uniqueness and private 
   }
 });
 
+test('identity bandwidth profiles validate rates and an old config uses the default', {
+  timeout: 8000,
+}, async t => {
+  const config = JSON.parse(await readFile(join(runtime, 'server.json'), 'utf8'));
+  const configPath = join(runtime, 'bad-bandwidth.json');
+  for (const rate of [null, [], { alice: 1024 }, { bob: '2097152' }, { alice: 65 * 1024 * 1024 }]) {
+    await writeFile(configPath, JSON.stringify({ ...config, bandwidthBytesPerSecond: rate }));
+    const invalid = launch(['dist/server.js', configPath], 2000);
+    invalid.child.stdin.end();
+    const result = await invalid.done;
+    assert.equal(result.code, 1, JSON.stringify(result));
+    assert.match(result.stderr, /Invalid bandwidth configuration/);
+  }
+  delete config.bandwidthBytesPerSecond;
+  const oldPath = join(runtime, 'old-bandwidth.json');
+  await writeFile(oldPath, JSON.stringify(config));
+  const old = launch(['dist/server.js', oldPath], 0);
+  old.child.stdin.end();
+  t.after(async () => { old.child.kill('SIGTERM'); await old.done; });
+  const [, listening] = await waitForOutput(old, /^LISTEN 127\.0\.0\.1:(\d+)$/m);
+  const peer = await openPeer(t, 'bob', { port: Number(listening) });
+  assert.equal((await exchange(peer, { op: 'ping' })).header.bandwidthBytesPerSecond, 8 * 1024 * 1024);
+  await quitPeer(peer);
+});
+
+test('two sockets share one identity bandwidth budget across both transfer directions', {
+  timeout: 9000,
+}, async t => {
+  const alice = await openPeer(t, 'alice');
+  const bob1 = await openPeer(t, 'bob');
+  const bob2 = await openPeer(t, 'bob');
+  const mib = 1024 * 1024;
+  const pings = await Promise.all([alice, bob1, bob2].map(peer => exchange(peer, { op: 'ping' })));
+  assert.deepEqual(pings.map(ping => ping.header.bandwidthBytesPerSecond), [8 * mib, 2 * mib, 2 * mib]);
+  const data = Buffer.alloc(mib, 42);
+  const sha256 = createHash('sha256').update(data).digest('hex');
+  const names = ['a-rate.bin', 'b-rate-a.bin', 'b-rate-b.bin'];
+  const elapsed = async operation => {
+    const start = performance.now();
+    const frame = await operation();
+    assert.equal(frame.header.status, 'ok', JSON.stringify(frame.header));
+    return { frame, ms: performance.now() - start };
+  };
+  const [fast, slow1, slow2] = await Promise.all([alice, bob1, bob2].map((peer, index) => elapsed(
+    () => exchange(peer, { op: 'put', name: names[index], sha256 }, data),
+  )));
+  const sharedUploads = Math.max(slow1.ms, slow2.ms);
+  assert(sharedUploads >= 900, `Concurrent Bob uploads took only ${sharedUploads} ms`);
+  assert(fast.ms + 300 < sharedUploads, `Alice ${fast.ms} ms vs Bob ${sharedUploads} ms`);
+
+  const half = data.subarray(0, CHUNK_BYTES);
+  const partial = { name: 'b-rate-mixed.bin', sha256: createHash('sha256').update(half).digest('hex') };
+  assert.equal((await exchange(bob2, { op: 'put-begin', ...partial, bytes: half.length })).header.offset, 0);
+  const [legacyGet, resumableUpload] = await Promise.all([
+    elapsed(() => exchange(bob1, { op: 'get', name: names[1] })),
+    elapsed(() => exchange(bob2, { op: 'put-chunk', ...partial, offset: 0 }, half)),
+  ]);
+  const mixed = Math.max(legacyGet.ms, resumableUpload.ms);
+  assert(mixed >= 675, `Concurrent Bob upload/download took only ${mixed} ms`);
+  assert.deepEqual(legacyGet.frame.payload, data);
+  assert.equal(resumableUpload.frame.header.offset, half.length);
+  assert.equal((await exchange(bob2, { op: 'put-finish', ...partial })).header.status, 'ok');
+  t.diagnostic(`1 MiB Alice upload ${Math.round(fast.ms)} ms, two parallel 1 MiB Bob uploads ${Math.round(sharedUploads)} ms, mixed 1.5 MiB Bob transfer ${Math.round(mixed)} ms.`);
+  await Promise.all([alice, bob1, bob2].map(quitPeer));
+});
+
 test('seventeenth stored file is refused and account quota remains sixteen', { timeout: 6000 }, async t => {
   const peer = await openPeer(t, 'bob');
   const payload = Buffer.alloc(0);

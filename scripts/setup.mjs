@@ -97,7 +97,10 @@ subjectKeyIdentifier = hash
         users[user] = client.fingerprint;
         writeConfig(directory, user, { host, port, servername, ca, key: client.key, cert: client.cert });
       }
-      writeConfig(directory, 'server', { host, port, ca, key: server.key, cert: server.cert, dataDir, users });
+      const bandwidthBytesPerSecond = { alice: 8 * 1024 * 1024, bob: 2 * 1024 * 1024 };
+      writeConfig(directory, 'server', {
+        host, port, ca, key: server.key, cert: server.cert, dataDir, users, bandwidthBytesPerSecond,
+      });
     } finally {
       rmSync(scratch, { recursive: true, force: true });
     }

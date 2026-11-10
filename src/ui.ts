@@ -4,7 +4,7 @@ import { lstat, mkdir, readFile } from 'node:fs/promises';
 import { basename, dirname, join, resolve } from 'node:path';
 import type { TLSSocket } from 'node:tls';
 import { connectClient, Session, closeSocket } from './session.js';
-import { digest, MAX_PAYLOAD, validName } from './protocol.js';
+import { digest, MAX_ACCOUNT_CONNECTIONS, MAX_PAYLOAD, validName } from './protocol.js';
 import { clearCheckpoint, downloadFile, uploadFile } from './transfer.js';
 
 class HttpError extends Error {
@@ -61,7 +61,8 @@ async function main(): Promise<void> {
   let busy = false;
   const transferSockets = new Set<TLSSocket>();
   const activeTransfers = new Set<string>();
-  const transferLimit = 3;
+  const transferLimit = MAX_ACCOUNT_CONNECTIONS - 1;
+  let bandwidthBytesPerSecond: number | null = null;
   let origin = '';
   const connected = () => Boolean(socket && !socket.destroyed && session);
 
@@ -74,7 +75,9 @@ async function main(): Promise<void> {
       session = undefined;
       socket = nextSocket;
       const nextSession = new Session(nextSocket);
-      await nextSession.exchange('ping');
+      const { header } = await nextSession.exchange('ping');
+      const rate = header.bandwidthBytesPerSecond;
+      bandwidthBytesPerSecond = typeof rate === 'number' && Number.isSafeInteger(rate) && rate > 0 ? rate : null;
       shutdown.signal.throwIfAborted();
       session = nextSession;
     } catch (error) {
@@ -164,6 +167,7 @@ async function main(): Promise<void> {
           connected: connected(), user: basename(configPath, '.json'),
           protocol: connected() ? socket?.getProtocol() : null,
           peer: config.host + ':' + config.port, filesLimit: 16, maxBytes: MAX_PAYLOAD, transferLimit,
+          bandwidthBytesPerSecond: connected() ? bandwidthBytesPerSecond : null,
         });
         return;
       }

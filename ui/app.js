@@ -160,6 +160,8 @@ function render() {
   byId('session-user').textContent = session?.user || '—';
   byId('session-protocol').textContent = connected ? session.protocol : '—';
   byId('session-peer').textContent = session?.peer || '—';
+  const rate = session?.bandwidthBytesPerSecond;
+  byId('session-bandwidth').textContent = connected && rate ? `账号共享 ${formatBytes(rate)}/s` : 'SFT/1 · mTLS';
   const openLabel = hasConnected ? '重新连接' : '连接';
   connectionButton.textContent = busy === 'disconnect' ? '正在断开' : connected ? '断开连接' : openLabel;
   connectionButton.disabled = Boolean(busy) || !token || running > 0;

@@ -1,6 +1,7 @@
 import { readFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { createServer, type TLSSocket } from 'node:tls';
+import { AccountBandwidth, DEFAULT_BANDWIDTH, parseBandwidthConfig } from './bandwidth.js';
 import {
   CHUNK_BYTES, MAX_ACCOUNT_CONNECTIONS, MAX_PAYLOAD, FrameReader, digest, validDigest, validName,
   writeFrame, type Frame,
@@ -13,7 +14,8 @@ const KEEPALIVE_MS = 10_000;
 const REQUEST_MS = 45_000;
 const REQUESTS_PER_MINUTE = 120;
 
-type User = { name: string; files: AccountStorage; connections: number };
+type User = { name: string; files: AccountStorage; connections: number; bandwidth: AccountBandwidth };
+type Reply = (header: Frame['header'], payload?: Buffer) => Promise<void>;
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -36,8 +38,9 @@ function fileInteger(value: unknown, minimum: number, maximum: number, label: st
   return value;
 }
 
-async function handleRequest(socket: TLSSocket, files: AccountStorage, frame: Frame): Promise<boolean> {
+async function handleRequest(send: Reply, user: User, frame: Frame): Promise<boolean> {
   const { op, name, sha256, bytes, offset } = frame.header;
+  const { files } = user;
   const ok = { op, status: 'ok' };
   try {
     if (op !== 'put' && op !== 'put-chunk' && frame.payload.length !== 0) {
@@ -45,17 +48,17 @@ async function handleRequest(socket: TLSSocket, files: AccountStorage, frame: Fr
     }
     switch (op) {
       case 'list':
-        await writeFrame(socket, { ...ok, files: await files.list() });
+        await send({ ...ok, files: await files.list() });
         break;
       case 'put':
         if (!validName(name)) throw new RequestError('Invalid file name');
         if (sha256 !== digest(frame.payload)) throw new RequestError('File digest mismatch');
         await files.store(name, frame.payload, sha256);
-        await writeFrame(socket, { ...ok, name, bytes: frame.payload.length, sha256 });
+        await send({ ...ok, name, bytes: frame.payload.length, sha256 });
         break;
       case 'get': {
         const payload = await files.load(filename(name));
-        await writeFrame(socket, { ...ok, name, bytes: payload.length, sha256: digest(payload) }, payload);
+        await send({ ...ok, name, bytes: payload.length, sha256: digest(payload) }, payload);
         break;
       }
       case 'put-begin': {
@@ -64,7 +67,7 @@ async function handleRequest(socket: TLSSocket, files: AccountStorage, frame: Fr
           bytes: fileInteger(bytes, 0, MAX_PAYLOAD, 'file length'),
           sha256: fileDigest(sha256),
         });
-        await writeFrame(socket, { ...ok, ...progress });
+        await send({ ...ok, ...progress });
         break;
       }
       case 'put-chunk': {
@@ -75,17 +78,17 @@ async function handleRequest(socket: TLSSocket, files: AccountStorage, frame: Fr
           throw new RequestError('Invalid upload chunk length');
         }
         const next = await files.append(target, expected, position, frame.payload);
-        await writeFrame(socket, { ...ok, name: target, sha256: expected, offset: next });
+        await send({ ...ok, name: target, sha256: expected, offset: next });
         break;
       }
       case 'put-finish': {
         const result = await files.finish(filename(name), fileDigest(sha256));
-        await writeFrame(socket, { ...ok, ...result });
+        await send({ ...ok, ...result });
         break;
       }
       case 'get-info': {
         const payload = await files.load(filename(name));
-        await writeFrame(socket, { ...ok, name, bytes: payload.length, sha256: digest(payload) });
+        await send({ ...ok, name, bytes: payload.length, sha256: digest(payload) });
         break;
       }
       case 'get-chunk': {
@@ -96,21 +99,23 @@ async function handleRequest(socket: TLSSocket, files: AccountStorage, frame: Fr
         const payload = await files.load(target);
         if (digest(payload) !== expected) throw new RequestError('File changed since download began');
         if (position + length > payload.length) throw new RequestError('Chunk exceeds file length');
-        await writeFrame(socket, {
+        await send({
           ...ok, name: target, sha256: expected, offset: position, bytes: length,
         }, payload.subarray(position, position + length));
         break;
       }
       case 'ping':
+        await send({ ...ok, bandwidthBytesPerSecond: user.bandwidth.bytesPerSecond });
+        break;
       case 'quit':
-        await writeFrame(socket, ok);
+        await send(ok);
         break;
       default:
         throw new RequestError('Unknown operation');
     }
   } catch (error) {
     if (!(error instanceof RequestError)) throw error;
-    await writeFrame(socket, {
+    await send({
       op: typeof op === 'string' && op.length <= 16 ? op : 'unknown',
       status: 'error',
       message: error.message,
@@ -123,6 +128,10 @@ async function handleRequest(socket: TLSSocket, files: AccountStorage, frame: Fr
 async function serveSession(socket: TLSSocket, user: User, id: number): Promise<void> {
   socket.setKeepAlive(true, KEEPALIVE_MS);
   const reader = new FrameReader(socket);
+  const closed = new AbortController();
+  socket.once('close', () => closed.abort());
+  const pace = (bytes: number) => user.bandwidth.wait(bytes, closed.signal);
+  const send: Reply = (header, payload) => writeFrame(socket, header, payload, pace);
   console.log(`SESSION ${id} OPEN ${user.name} ${socket.getProtocol()}`);
   let windowStart = performance.now();
   let requestCount = 0;
@@ -131,14 +140,14 @@ async function serveSession(socket: TLSSocket, user: User, id: number): Promise<
       // The deadline covers the full frame and response, even if a peer trickles bytes.
       const deadline = setTimeout(() => socket.destroy(new Error('Request deadline exceeded')), REQUEST_MS);
       try {
-        const frame = await reader.read();
+        const frame = await reader.read(pace);
         if (!frame) break;
         if (performance.now() - windowStart >= 60_000) {
           windowStart = performance.now();
           requestCount = 0;
         }
         if (++requestCount > REQUESTS_PER_MINUTE) throw new Error('Session request limit exceeded');
-        if (!(await handleRequest(socket, user.files, frame))) break;
+        if (!(await handleRequest(send, user, frame))) break;
         const op = frame.header.op;
         if (typeof op === 'string' && op !== 'ping') {
           console.log(`SESSION ${id} ${user.name} ${op.slice(0, 16).replace(/[^a-z-]/g, '')}`);
@@ -163,6 +172,7 @@ async function main(): Promise<void> {
   const base = dirname(resolve(configFile));
   const storage = resolve(base, config.dataDir);
   await requirePrivateDirectory(storage);
+  const rates = parseBandwidthConfig(config.bandwidthBytesPerSecond);
   const users = new Map<string, User>();
   for (const [name, fingerprint] of Object.entries(config.users)) {
     if (!validName(name) || !/^[a-z][a-z0-9_-]{0,31}$/.test(name)
@@ -172,7 +182,8 @@ async function main(): Promise<void> {
     await requirePrivateDirectory(directory);
     const files = new AccountStorage(directory);
     await files.initialize();
-    users.set(fingerprint, { name, files, connections: 0 });
+    const bandwidth = new AccountBandwidth(rates.get(name) ?? DEFAULT_BANDWIDTH);
+    users.set(fingerprint, { name, files, connections: 0, bandwidth });
   }
   if (users.size === 0) throw new Error('Configure at least one client certificate');
 
