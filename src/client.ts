@@ -1,121 +1,12 @@
 import { randomUUID } from 'node:crypto';
-import { once } from 'node:events';
 import { constants } from 'node:fs';
-import { link, open, readFile, unlink } from 'node:fs/promises';
+import { link, open, unlink } from 'node:fs/promises';
 import { basename, dirname, join, resolve } from 'node:path';
 import { createInterface } from 'node:readline';
-import { connect, type TLSSocket } from 'node:tls';
-import { digest, FrameReader, MAX_PAYLOAD, validName, writeFrame } from './protocol.js';
+import { digest, MAX_PAYLOAD, validName } from './protocol.js';
 
-const REQUEST_TIMEOUT_MS = 45_000;
+import { connectClient, Session, closeSocket } from './session.js';
 const PING_INTERVAL_MS = 15_000;
-
-async function connectClient(configPath: string): Promise<TLSSocket> {
-  const config = JSON.parse(await readFile(configPath, 'utf8'));
-  if (!config || typeof config !== 'object') {
-    throw new Error('Client configuration must be a JSON object.');
-  }
-
-  const { host, port, servername, ca, cert, key } = config;
-  if (
-    typeof host !== 'string' || !host ||
-    !Number.isInteger(port) || port < 1 || port > 65535 ||
-    typeof servername !== 'string' || !servername ||
-    typeof ca !== 'string' || !ca ||
-    typeof cert !== 'string' || !cert ||
-    typeof key !== 'string' || !key
-  ) {
-    throw new Error('Client configuration needs host, port, servername, ca, cert and key.');
-  }
-
-  const directory = dirname(resolve(configPath));
-  const [caPem, certPem, keyPem] = await Promise.all([
-    readFile(resolve(directory, ca)),
-    readFile(resolve(directory, cert)),
-    readFile(resolve(directory, key)),
-  ]);
-  const socket = connect({
-    host, port, servername,
-    ca: caPem, cert: certPem, key: keyPem,
-    minVersion: 'TLSv1.3',
-    rejectUnauthorized: true,
-  });
-  const deadline = setTimeout(() => socket.destroy(new Error('TLS handshake timed out.')), 5000);
-  try {
-    await once(socket, 'secureConnect');
-    socket.setKeepAlive(true, 10_000);
-    return socket;
-  } catch (error) {
-    socket.destroy();
-    throw error;
-  } finally {
-    clearTimeout(deadline);
-  }
-}
-
-class Session {
-  private readonly reader: FrameReader;
-  private pending = Promise.resolve();
-
-  constructor(private readonly socket: TLSSocket) {
-    this.reader = new FrameReader(socket);
-  }
-
-  exchange(op: string, header: Record<string, unknown> = {}, payload?: Buffer) {
-    const request = this.pending.then(async () => {
-      const deadline = setTimeout(() => {
-        this.socket.destroy(new Error('Request timed out.'));
-      }, REQUEST_TIMEOUT_MS);
-      try {
-        if (this.socket.destroyed) {
-          throw new Error('The connection is closed.');
-        }
-        const response = await this.roundTrip(op, header, payload);
-        if (
-          !response || response.header.op !== op ||
-          (response.header.status !== 'ok' && response.header.status !== 'error') ||
-          ((op !== 'get' || response.header.status !== 'ok') && response.payload.length !== 0)
-        ) {
-          this.socket.destroy();
-          throw new Error('Missing or invalid server response.');
-        }
-        if (response.header.status === 'error') {
-          const message = response.header.message;
-          throw new Error(typeof message === 'string' ? message : 'The server rejected the request.');
-        }
-        return response;
-      } finally {
-        clearTimeout(deadline);
-      }
-    });
-    this.pending = request.then(() => undefined, () => undefined);
-    return request;
-  }
-
-  private async roundTrip(op: string, header: Record<string, unknown>, payload?: Buffer) {
-    try {
-      await writeFrame(this.socket, { ...header, op }, payload);
-      return await this.reader.read();
-    } catch (error) {
-      this.socket.destroy();
-      throw error;
-    }
-  }
-}
-
-async function closeSocket(socket: TLSSocket): Promise<void> {
-  if (socket.destroyed) {
-    return;
-  }
-  const deadline = setTimeout(() => socket.destroy(), 2000);
-  try {
-    const closed = once(socket, 'close');
-    socket.end();
-    await closed;
-  } finally {
-    clearTimeout(deadline);
-  }
-}
 
 function parseCommand(line: string): string[] {
   const text = line.trim();
