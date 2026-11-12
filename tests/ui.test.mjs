@@ -79,6 +79,7 @@ function session(action) {
 }
 
 before(async () => {
+  // 在独立的临时环境启动服务和适配器，从启动日志取得端口与测试令牌。
   root = await mkdtemp(join(tmpdir(), 'sft-ui-test-'));
   runtime = join(root, 'runtime');
   await execNode(process.execPath, ['scripts/setup.mjs', runtime], {
@@ -96,6 +97,7 @@ before(async () => {
 });
 
 after(async () => {
+  // 等待子进程释放监听端口和文件句柄，再清理临时环境。
   try {
     await Promise.all(children.map(async ({ child, done }) => {
       child.kill('SIGTERM');
@@ -141,7 +143,7 @@ test('local API requires the terminal bootstrap token and rejects unrelated brow
   const queryToken = await request('/api/status?token=' + token);
   assert.equal(queryToken.status, 403);
   assert.ok(!(await queryToken.text()).includes(token));
-  // Node's Fetch normalizes Host. Use the HTTP client to preserve the supplied value.
+  // Node.js 的 fetch 会规范化 Host。这里用 HTTP 客户端发送指定值。
   const hostStatus = await new Promise((resolve, reject) => {
     const request = get(origin + '/api/status', {
       headers: { host: 'localhost', 'x-sft-token': token },
@@ -235,6 +237,7 @@ test('browser adapter resumes a staged upload and verifies the downloaded file',
   const name = 'ui-resume.bin';
   const data = Buffer.alloc(CHUNK_BYTES + 9, 127);
   const sha256 = createHash('sha256').update(data).digest('hex');
+  // 先通过协议会话留下暂存分块，再由浏览器适配器恢复上传。
   const socket = await connectClient(join(runtime, 'alice.json'));
   try {
     const direct = new Session(socket);
@@ -281,7 +284,7 @@ test('the same browser account uploads two files while downloading a third', asy
     }
     const uploads = Promise.all(running);
     void uploads.catch(() => {});
-    // Both TLS task connections must be open while their upload bodies are paused.
+    // 两个请求体暂停发送时，先确认各自的 TLS 任务连接已经建立。
     await waitForOutput(server, /SESSION \d+ OPEN alice TLSv1\.3[\s\S]*SESSION \d+ OPEN alice TLSv1\.3/, start);
     await apiJson('disconnect', { method: 'POST' }, 409);
     const response = await api('download-resume?name=parallel-source.bin');
@@ -299,6 +302,7 @@ test('the same browser account uploads two files while downloading a third', asy
   }
 });
 
+// 让本地对端停在两个连接阶段，验证退出时可以取消尚未完成的浏览器请求。
 for (const stage of ['TLS handshake', 'application authorization ping']) {
   test(`bridge shutdown closes an in-flight ${stage}`, {
     timeout: 7000,

@@ -76,6 +76,7 @@ button:disabled, input:disabled { cursor: not-allowed; }
 .site-label { gap: 7px; color: var(--secondary); font-size: .77rem; white-space: nowrap; }
 .site-label > span { width: 6px; height: 6px; border: 1px solid #737b87; border-radius: 50%; }
 
+/* 宽屏并排显示页面标题与会话状态，窄屏下改为单列。 */
 .hero {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(330px, 380px);
@@ -172,6 +173,7 @@ h1 {
 }
 .notice[data-kind="error"] { background: var(--red-tint); border-color: #f2d8db; color: var(--red); }
 
+/* 目录和上传区域共用外框，宽屏时用内侧分隔线区分。 */
 .workspace {
   display: grid;
   grid-template-columns: minmax(0, 1.52fr) minmax(0, 1fr);
@@ -268,6 +270,7 @@ td.file-select, th.file-select { width: 26px; padding-right: 6px; }
 .field-hint code { font-family: var(--mono); }
 .queue-status { margin-top: 10px; color: var(--secondary); font-size: .77rem; font-weight: 590; overflow-wrap: anywhere; }
 
+/* 队列的文字状态由脚本设置，颜色和进度条样式在此统一。 */
 .transfer-queue { margin-top: 8px; padding: 0; display: grid; gap: 7px; list-style: none; }
 .transfer-queue:empty { display: none; }
 .queue-item {
@@ -302,6 +305,7 @@ td.file-select, th.file-select { width: 26px; padding-right: 6px; }
 .activity-empty { padding-block: 13px 4px; color: var(--secondary); font-size: .82rem; }
 .activity-log { padding: 0; list-style: none; }
 .activity-log:not(:empty) { margin-top: 10px; }
+/* 中间列可收缩换行，避免长文件名或摘要撑宽传输记录。 */
 .activity-row {
   display: grid;
   grid-template-columns: 61px minmax(0, 1fr) minmax(53px, auto);

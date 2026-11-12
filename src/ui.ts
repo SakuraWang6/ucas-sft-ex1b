@@ -11,6 +11,7 @@ class HttpError extends Error {
   constructor(readonly status: number, message: string) { super(message); }
 }
 
+// 先检查 HTTP 请求声明的长度，再限制实际接收的字节数。
 async function body(request: IncomingMessage): Promise<Buffer> {
   const length = Number(request.headers['content-length']);
   if (!Number.isSafeInteger(length) || length < 0 || length > MAX_PAYLOAD) {
@@ -35,6 +36,7 @@ function json(response: ServerResponse, status: number, data: unknown): void {
 async function main(): Promise<void> {
   const configPath = process.argv[2];
   if (!configPath || process.argv.length !== 3) throw new Error('Usage: node dist/ui.js <client.json>');
+  // 下载检查点存放在对应客户端配置的私有缓存目录，按远端文件名区分。
   const cacheDir = join(dirname(resolve(configPath)), '.sft-download-' + basename(configPath, '.json'));
   async function checkpointPath(name: string) {
     await mkdir(cacheDir, { mode: 0o700 }).catch(error => {
@@ -61,6 +63,7 @@ async function main(): Promise<void> {
   let busy = false;
   const transferSockets = new Set<TLSSocket>();
   const activeTransfers = new Set<string>();
+  // 为列表查询和保活预留一条控制连接，其余账号连接名额分给传输任务。
   const transferLimit = MAX_ACCOUNT_CONNECTIONS - 1;
   let bandwidthBytesPerSecond: number | null = null;
   let origin = '';
@@ -75,6 +78,7 @@ async function main(): Promise<void> {
       session = undefined;
       socket = nextSocket;
       const nextSession = new Session(nextSocket);
+      // 通过应用层授权探测后才公布控制会话，并记录服务端返回的账号速率。
       const { header } = await nextSession.exchange('ping');
       const rate = header.bandwidthBytesPerSecond;
       bandwidthBytesPerSecond = typeof rate === 'number' && Number.isSafeInteger(rate) && rate > 0 ? rate : null;
@@ -113,6 +117,7 @@ async function main(): Promise<void> {
     }
     activeTransfers.add(key);
     const cancel = new AbortController();
+    // 浏览器取消请求或桥接进程退出时，停止该任务对应的 TLS 连接。
     response.once('close', () => cancel.abort());
     const signal = AbortSignal.any([cancel.signal, shutdown.signal]);
     let workerSocket: TLSSocket | undefined;
@@ -143,8 +148,10 @@ async function main(): Promise<void> {
     response.setHeader('Cache-Control', 'no-store');
     response.setHeader('X-Content-Type-Options', 'nosniff');
     response.setHeader('Referrer-Policy', 'no-referrer');
+    // 脚本、样式和接口连接限于同源，界面禁止嵌入其他页面。
     response.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' blob:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'");
     try {
+      // 回环地址的 Host 检查适用于所有请求。静态资源加载后，API 还要校验来源和令牌。
       if (request.headers.host !== new URL(origin).host) {
         throw new HttpError(403, '仅允许本机界面访问');
       }
@@ -171,6 +178,7 @@ async function main(): Promise<void> {
         });
         return;
       }
+      // 每个续传任务独立建立 TLS 会话，避免文件传输占用控制连接。
       const uploadResume = url.pathname === '/api/upload-resume' && request.method === 'POST';
       const downloadResume = url.pathname === '/api/download-resume' && request.method === 'GET';
       if (uploadResume || downloadResume) {
@@ -264,6 +272,7 @@ async function main(): Promise<void> {
     const address = server.address();
     if (address && typeof address !== 'string') {
       origin = 'http://127.0.0.1:' + address.port;
+      // URL 片段只在浏览器端读取，不会随页面的 HTTP 请求发给桥接服务。
       console.log('UI ' + origin + '/#token=' + token);
     }
   });
@@ -278,6 +287,7 @@ async function main(): Promise<void> {
   for (const signal of ['SIGINT', 'SIGTERM'] as const) {
     process.once(signal, () => {
       if (shutdown.signal.aborted) return;
+      // 先取消进行中的握手和传输，再关闭已建立的连接与 HTTP 监听。
       shutdown.abort();
       clearInterval(heartbeat);
       socket?.destroy();

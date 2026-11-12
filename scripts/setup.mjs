@@ -18,6 +18,7 @@ function openssl(...args) {
 }
 
 function serial() {
+  // 固定首字节使随机序列号保持为正整数。
   return `0x01${randomBytes(15).toString('hex')}`;
 }
 
@@ -41,6 +42,7 @@ function issueCertificate(directory, scratch, identity, role) {
   const request = join(scratch, `${identity}.csr`);
   const config = join(scratch, `${identity}.cnf`);
   const subject = role === 'serverAuth' ? servername : identity;
+  // 服务端证书声明回环域名和 IP。客户端账号由服务端通过证书指纹识别。
   const alternateNames = role === 'serverAuth' ? `subjectAltName = DNS:${servername},IP:${host}\n` : '';
 
   writeFileSync(config, `[req]
@@ -65,8 +67,10 @@ ${alternateNames}`);
 }
 
 function initialize(directory, port) {
+  // 独占创建运行目录。仅在本次创建成功后接管失败清理。
   mkdirSync(directory, { mode: 0o700 });
   try {
+    // 每个运行目录使用独立的根 CA，签名私钥和证书请求留在临时目录。
     const scratch = mkdtempSync(join(tmpdir(), 'sft-ca-'));
     try {
       const config = join(scratch, 'ca.cnf');
@@ -102,6 +106,7 @@ subjectKeyIdentifier = hash
         host, port, ca, key: server.key, cert: server.cert, dataDir, users, bandwidthBytesPerSecond,
       });
     } finally {
+      // 后续 TLS 验证只需要公开的 CA 证书。
       rmSync(scratch, { recursive: true, force: true });
     }
   } catch (error) {
@@ -117,6 +122,7 @@ try {
   if (!/^\d{1,5}$/.test(port) || Number(port) > 65535) {
     throw new Error('SFT_PORT must be an integer between 0 and 65535');
   }
+  // OpenSSL 子进程继承此权限掩码，生成的私钥仅当前用户可访问。
   process.umask(0o077);
   initialize(resolve(args[0] ?? 'runtime'), Number(port));
   console.log('Initialized local TLS certificates, server.json, alice.json, bob.json, and private storage.');

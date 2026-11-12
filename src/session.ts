@@ -24,6 +24,7 @@ export async function connectClient(configPath: string, signal?: AbortSignal): P
     throw new Error('Client configuration needs host, port, servername, ca, cert and key.');
   }
 
+  // 证书路径相对于配置文件解析。客户端使用 CA 和 servername 验证服务端身份。
   const directory = dirname(resolve(configPath));
   const [caPem, certPem, keyPem] = await Promise.all([
     readFile(resolve(directory, ca), { signal }),
@@ -59,6 +60,7 @@ export class Session {
     this.reader = new FrameReader(socket);
   }
 
+  // 同一条连接依次处理请求，读取到的响应帧对应当前请求。
   exchange(op: string, header: Record<string, unknown> = {}, payload?: Buffer) {
     const request = this.pending.then(async () => {
       const deadline = setTimeout(() => {
@@ -86,6 +88,7 @@ export class Session {
         clearTimeout(deadline);
       }
     });
+    // 当前请求失败后仍释放队列，后续请求可在连接可用时继续执行。
     this.pending = request.then(() => undefined, () => undefined);
     return request;
   }

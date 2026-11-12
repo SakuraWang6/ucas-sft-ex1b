@@ -35,6 +35,7 @@
         <h1 id="page-title">安全文件传输台</h1>
         <p class="intro-text">管理当前账号的远端文件，并在传输完成后核对 SHA-256。</p>
       </div>
+      <!-- 连接状态、远端地址和账号速率由桥接服务返回。 -->
       <section class="connection" aria-labelledby="connection-title">
         <div class="connection-head">
           <h2 id="connection-title"><svg class="icon" aria-hidden="true"><use href="#icon-link"/></svg> 传输会话</h2>
@@ -78,6 +79,7 @@
         <table id="files-table" hidden>
           <caption class="sr-only">当前账号的远端文件</caption>
           <thead><tr><th scope="col">文件名</th><th scope="col">大小</th><th scope="col"><span class="sr-only">操作</span></th></tr></thead>
+          <!-- 文件行、复选框和下载操作由脚本根据远端目录生成。 -->
           <tbody id="files-body"></tbody>
         </table>
       </section>
@@ -99,6 +101,7 @@
         </label>
         <p class="field-hint" id="name-hint">使用英文字母、数字或 <code>._-</code>，以字母或数字开头。</p>
         <p class="queue-status" id="queue-status" role="status" hidden></p>
+        <!-- 上传和下载任务共用此队列，暂停或重试按钮随任务状态更新。 -->
         <ol class="transfer-queue" id="upload-queue" aria-label="传输队列"></ol>
       </section>
     </div>

@@ -3,6 +3,7 @@ import { link, lstat, mkdir, open, readdir, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
 import { digest, MAX_PAYLOAD, validDigest, validName } from './protocol.js';
 
+// 每个账号有独立的文件目录，已完成文件与续传暂存文件共用名额。
 const MAX_FILES = 16;
 const SAFE_OPEN = (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0);
 
@@ -26,6 +27,7 @@ async function existing(path: string) {
 }
 
 export async function requirePrivateDirectory(path: string): Promise<void> {
+  // 检查目录本身，以拒绝用符号链接替代存储路径。
   const stat = await lstat(path);
   if (!stat.isDirectory() || (process.platform !== 'win32' && (stat.mode & 0o077) !== 0)) {
     throw new Error('Storage must be a private directory owned by the server account');
@@ -75,6 +77,7 @@ async function discard(path: string): Promise<void> {
 }
 
 async function partialOffset(partial: PartialFile): Promise<number> {
+  // 暂存文件实际长度就是下一次写入的偏移，进程重启后仍可从磁盘恢复。
   const stat = await lstat(partial.path);
   if (!stat.isFile() || stat.size > partial.bytes) throw new RequestError('Upload staging file is invalid');
   return stat.size;
@@ -87,6 +90,7 @@ async function append(partial: PartialFile, offset: number, payload: Buffer): Pr
   try {
     const stat = await handle.stat();
     if (!stat.isFile() || stat.nlink !== 1) throw new RequestError('Upload staging file is invalid');
+    // 只允许从当前末尾追加，防止重试或并行请求改写已收到的数据。
     if (stat.size !== offset) throw new RequestError('Upload offset does not match');
     let written = 0;
     while (written < payload.length) {
@@ -94,6 +98,7 @@ async function append(partial: PartialFile, offset: number, payload: Buffer): Pr
       if (bytesWritten === 0) throw new Error('Could not write upload chunk');
       written += bytesWritten;
     }
+    // 同步成功后才确认新偏移，客户端收到确认即可继续发送下一块。
     await handle.sync();
     return offset + written;
   } finally {
@@ -183,6 +188,7 @@ export class AccountStorage {
   }
 
   private async exclusive<T>(name: string, work: () => Promise<T>): Promise<T> {
+    // 同名操作跨会话互斥，大小写变体共用锁，以适配大小写不敏感的文件系统。
     const key = name.toLowerCase();
     if (this.activeFiles.has(key)) throw new RequestError('File is busy');
     this.activeFiles.add(key);
@@ -194,6 +200,7 @@ export class AccountStorage {
   }
 
   private updateMetadata<T>(work: () => Promise<T>): Promise<T> {
+    // 将配额检查、名额预留和发布串行化，避免并行上传重复占用名额。
     const result = this.metadata.then(work);
     this.metadata = result.then(() => undefined, () => undefined);
     return result;
@@ -238,7 +245,7 @@ export class AccountStorage {
         names.add(partial.name.toLowerCase());
       }
       if (names.size >= MAX_FILES) throw new RequestError('Storage is full');
-      // Metadata in the pathname makes initialization a single atomic create.
+      // 文件名记录目标名称、总长度与摘要，独占创建即可原子登记一个续传任务。
       const path = join(this.staging, `${info.name}.${info.bytes}.${info.sha256}`);
       const file = await open(path, 'wx', 0o600);
       await file.close();
@@ -253,6 +260,7 @@ export class AccountStorage {
     if (!stat.isFile() || stat.size > MAX_PAYLOAD) throw new RequestError('File already exists');
     const payload = await loadFile(path);
     if (!validDigest(sha256) || digest(payload) !== sha256) throw new RequestError('File already exists');
+    // 发布后若响应丢失，重试可返回相同文件的结果，并清理可能遗留的暂存链接。
     const partial = await this.findPartial(name);
     if (partial?.sha256 === sha256 && partial.bytes === payload.length) await discard(partial.path);
     return { name, bytes: payload.length, sha256 };
@@ -261,7 +269,7 @@ export class AccountStorage {
   private publish(partial: PartialFile): Promise<void> {
     return this.updateMetadata(async () => {
       try {
-        // This link exposes the complete file atomically and cannot overwrite an existing file.
+        // 校验通过后用硬链接原子发布，目标名已存在时保留原文件。
         await link(partial.path, join(this.directory, partial.name));
       } catch (error) {
         if (errorCode(error) === 'EEXIST') throw new RequestError('File already exists');

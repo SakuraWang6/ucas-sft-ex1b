@@ -28,7 +28,7 @@ function launch(args, timeout = 8000) {
   child.stdout.setEncoding('utf8').on('data', data => { stdout += data; });
   child.stderr.setEncoding('utf8').on('data', data => { stderr += data; });
   child.stdin.on('error', () => {
-    // If a child closes stdin early, its exit status and diagnostics report why.
+    // 子进程提前关闭标准输入时，从退出状态和日志判断原因。
   });
   const timer = timeout ? setTimeout(() => child.kill('SIGKILL'), timeout) : undefined;
   const done = new Promise((resolve, reject) => {
@@ -71,6 +71,7 @@ function quoted(path) {
 }
 
 before(async () => {
+  // 为本套件生成临时证书和存储，用服务日志中的实际端口配置客户端。
   root = await mkdtemp(join(tmpdir(), 'sft-test-'));
   runtime = join(root, 'runtime');
   await execNode(process.execPath, ['scripts/setup.mjs', runtime], {
@@ -89,6 +90,7 @@ before(async () => {
 });
 
 after(async () => {
+  // 先等待服务进程退出，再删除它使用的证书和存储目录。
   try {
     if (server) {
       server.child.kill('SIGTERM');
@@ -302,6 +304,7 @@ function waitForClose(socket, timeout = 3000) {
 }
 
 async function openPeer(t, name, options = {}) {
+  // 直接读取协议响应，便于核对命令行输出中省略的字段。
   const socket = connect({ ...await peerOptions(name), ...options });
   socket.on('error', () => {});
   t.after(() => socket.destroy());
@@ -377,6 +380,7 @@ test('resumable upload survives server restart and a ranged download survives re
   await first.child.done;
   interrupted.socket.destroy();
 
+  // 重启时复用原存储目录，验证续传偏移能从磁盘恢复。
   const restarted = await startServer();
   const resumed = await openPeer(t, 'alice', { port: restarted.port });
   const checkpoint = await exchange(resumed, begin);
@@ -547,6 +551,7 @@ test('same-account sessions transfer different files concurrently without overla
     assert.equal((await exchange(peer, { op: 'put-begin', ...file, bytes: payload.length })).header.offset, 0);
   }
   await Promise.all([begin(first, leftFile, left), begin(second, rightFile, right)]);
+  // 同名分块的竞争与另一文件的传输同时发生，验证互斥范围限于文件名。
   const [overlapping, other] = await Promise.all([
     Promise.all([first, second].map(peer => exchange(peer, { op: 'put-chunk', ...leftFile, offset: 0 }, left))),
     exchange(third, { op: 'put-chunk', ...rightFile, offset: 0 }, right),
@@ -658,6 +663,7 @@ test('two sockets share one identity bandwidth budget across both transfer direc
   const data = Buffer.alloc(mib, 42);
   const sha256 = createHash('sha256').update(data).digest('hex');
   const names = ['a-rate.bin', 'b-rate-a.bin', 'b-rate-b.bin'];
+  // 比较并行任务中的最长耗时，判断多个连接是否共用账号的载荷速率。
   const elapsed = async operation => {
     const start = performance.now();
     const frame = await operation();
@@ -775,6 +781,7 @@ test('connection cap refuses the thirteenth socket and releases capacity after c
 test('real-time deadlines expire incomplete peers while heartbeat preserves a healthy session', {
   timeout: 54000,
 }, async t => {
+  // 用真实计时同时观测未完成握手、未完成帧和正常保活会话。
   const bob = launchClient('bob', 52000);
   t.after(async () => {
     bob.child.kill('SIGTERM');

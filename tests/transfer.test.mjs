@@ -11,6 +11,7 @@ const sample = Buffer.alloc(CHUNK_BYTES + 19, 42);
 const sha256 = digest(sample);
 const metadata = { name, bytes: sample.length, sha256 };
 
+// 用可控的对端记录每次请求的偏移，精确安排连接中断或数据变化。
 function downloadPeer(offsets, { interrupt, changed } = {}) {
   return {
     async exchange(op, header) {
@@ -27,6 +28,7 @@ function downloadPeer(offsets, { interrupt, changed } = {}) {
 }
 
 async function checkpoint(t) {
+  // 每个用例使用独立的检查点，结束后清理临时目录。
   const directory = await mkdtemp(join(tmpdir(), 'sft-download-test-'));
   t.after(() => rm(directory, { recursive: true, force: true }));
   return join(directory, 'checkpoint.part');

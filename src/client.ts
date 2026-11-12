@@ -23,6 +23,7 @@ function parseCommand(line: string): string[] {
   ));
 }
 
+// 以非阻塞方式打开路径，再校验文件类型、大小和读取前后的修改时间。
 async function readUpload(path: string): Promise<Buffer> {
   const file = await open(path, constants.O_RDONLY | constants.O_NONBLOCK);
   try {
@@ -49,6 +50,7 @@ async function readUpload(path: string): Promise<Buffer> {
   }
 }
 
+// 先写同目录的临时文件，再用硬链接发布。目标文件已存在时不会覆盖。
 async function saveDownload(path: string, data: Buffer): Promise<void> {
   const target = resolve(path);
   const temporary = join(dirname(target), `.sft-${randomUUID()}.part`);
@@ -112,6 +114,7 @@ async function execute(session: Session, [op, first, second, ...extra]: string[]
   }
   if (op === 'get-resume' && validName(first) && second !== '' && extra.length === 0) {
     const target = resolve(second ?? first);
+    // 检查点由本地目标路径和远端文件名共同确定。
     const key = digest(Buffer.from(JSON.stringify([target, first])));
     const checkpoint = join(dirname(target), `.sft-download-${key}.part`);
     const result = await downloadFile(session, first, checkpoint);
@@ -145,10 +148,10 @@ async function main(): Promise<void> {
 
   const socket = await connectClient(process.argv[2]);
   socket.on('error', () => {
-    // Pending requests and the close event report the failure.
+    // 由等待响应的请求或连接关闭事件报告错误。
   });
   const session = new Session(socket);
-  // In TLS 1.3 the client handshake event can precede server-side identity acceptance.
+  // TLS 握手事件可能先于服务端完成账号授权，以应用层 ping 确认可用。
   await session.exchange('ping');
   const interactive = Boolean(process.stdin.isTTY && process.stdout.isTTY);
   const input = createInterface({
@@ -170,6 +173,7 @@ async function main(): Promise<void> {
     }
   });
 
+  // 命令和应用层心跳使用同一会话。处理命令或已有心跳待确认时不再发送心跳。
   const pings = setInterval(() => {
     if (!busy && !closing && !pingPending) {
       pingPending = true;
@@ -209,6 +213,7 @@ async function main(): Promise<void> {
         input.prompt();
       }
     }
+    // 正常退出先完成 quit 请求与响应，再关闭 TLS 连接。
     closing = true;
     if (!socket.destroyed) {
       await session.exchange('quit');

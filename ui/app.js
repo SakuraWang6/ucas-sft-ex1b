@@ -34,6 +34,7 @@ class BridgeError extends Error {
   }
 }
 
+// 从启动链接的片段取得令牌，清理地址栏后在当前标签页保存。
 function readToken() {
   const fragment = new URLSearchParams(location.hash.slice(1)).get('token');
   if (fragment === null) return sessionStorage.getItem(tokenKey);
@@ -215,6 +216,7 @@ async function refreshFiles() {
   renderFiles();
 }
 
+// 控制操作一次只执行一项。递增版本号，使已经发出的旧轮询结果失效。
 async function operate(kind, run) {
   if (busy) return;
   busy = kind;
@@ -287,6 +289,7 @@ function renderTransfers() {
       button.setAttribute('aria-label', `${button.textContent} ${task.kind} ${task.name}`);
       button.disabled = Boolean(task.controller?.signal.aborted) || (!canPause && !session?.connected);
       button.addEventListener('click', () => {
+        // 暂停活动任务时取消 HTTP 请求，重试时沿用已保存的分块。
         if (task.state === 'active') {
           task.controller.abort();
         } else if (task.state === 'queued') {
@@ -304,6 +307,7 @@ function renderTransfers() {
   }));
 }
 
+// 同一方向和文件名只保留一个等待或活动任务。队列满时先移除非活动项。
 function enqueue(entries) {
   if (busy || !session?.connected) return;
   showNotice('');
@@ -336,6 +340,7 @@ function upload(selectedFiles) {
   enqueue(selectedFiles.map(file => ({ kind: '上传', name: override || file.name, bytes: file.size, file })));
 }
 
+// 浏览器计算本地摘要以核对上传回执，也会校验下载内容后再触发保存。
 async function performTransfer(task, signal) {
   const { name, bytes, file } = task;
   const query = `name=${encodeURIComponent(name)}`;
@@ -374,6 +379,7 @@ async function performTransfer(task, signal) {
 }
 
 async function runTransfer(task) {
+  // 在等待网络响应前占用并行名额，后续调度可以立即看到任务状态。
   task.state = 'active';
   task.controller = new AbortController();
   running += 1;
@@ -396,6 +402,7 @@ async function runTransfer(task) {
   }
 }
 
+// 上传与下载共享并行名额。活动任务全部结束后，合并刷新远端目录。
 function pumpTransfers() {
   if (!busy && session?.connected) {
     const limit = session.transferLimit ?? defaultLimits.transferLimit;
@@ -493,6 +500,7 @@ setInterval(async () => {
   polling = true;
   try {
     const status = await json('status');
+    // 忽略连接状态切换前发出的轮询结果，避免旧状态覆盖新状态。
     if (revision !== started) return;
     const wasConnected = session?.connected;
     session = status;

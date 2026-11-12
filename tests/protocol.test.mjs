@@ -11,6 +11,7 @@ function readBytes(bytes) {
   return reader.read();
 }
 
+// 独立构造输入帧，使解码边界测试可以单独设置声明长度。
 function wire(header, payload = Buffer.alloc(0), {
   magic = 'SFT1', headerBytes = header.length, payloadBytes = payload.length,
 } = {}) {
@@ -39,6 +40,7 @@ test('empty and exactly 8 MiB frames preserve binary payload and SHA-256', async
 });
 
 test('exactly 4096 UTF-8 header bytes are accepted', async () => {
+  // 混用单字节和多字节字符，区分 UTF-8 字节长度与字符串长度。
   const header = { op: 'ping', pad: '中'.repeat(1000) };
   header.pad += 'x'.repeat(4096 - Buffer.byteLength(JSON.stringify(header)));
   const encoded = Buffer.from(JSON.stringify(header));

@@ -1,5 +1,6 @@
 import { setTimeout as delay } from 'node:timers/promises';
 
+// 每账号使用一个应用层载荷限速器，上传与下载共用同一速率。
 const MIB = 1024 * 1024;
 export const DEFAULT_BANDWIDTH = 8 * MIB;
 const MIN_BANDWIDTH = 2 * MIB;
@@ -28,7 +29,7 @@ export class AccountBandwidth {
   async wait(bytes: number, signal: AbortSignal): Promise<void> {
     signal.throwIfAborted();
     const now = performance.now();
-    // Reserve this payload block on the shared timeline before any other socket can reserve one.
+    // 在等待前同步预留本块额度，让同账号的并行连接依次取得发送或读取时机。
     const readyAt = Math.max(now, this.availableAt) + bytes * 1000 / this.bytesPerSecond;
     this.availableAt = readyAt;
     await delay(Math.ceil(readyAt - now), undefined, { signal });

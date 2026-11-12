@@ -4,6 +4,7 @@ import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const sandbox = '/usr/bin/sandbox-exec';
+// 策略默认拒绝。服务代码、配置和凭据按路径放行读取，存储目录可读写。
 const profile = `
 (version 1)
 (deny default)
@@ -14,7 +15,7 @@ const profile = `
   (subpath "/usr/lib"))
 (allow sysctl-read)
 (allow signal (target self))
-; Path metadata is separate from opening a file or listing its contents.
+; 读取路径元数据与读取文件或目录内容属于不同权限。
 (allow file-read-metadata)
 (allow file-read*
   (literal (param "NODE"))
@@ -44,6 +45,7 @@ async function runtimePath(root, name, field, isDirectory = false) {
     throw new Error(`${field} must be a relative path inside the runtime directory`);
   }
   const path = resolve(root, name);
+  // 同时核对路径归属和实际解析结果，排除跨目录路径与符号链接。
   if (!inside(root, path) || await realpath(path) !== path) {
     throw new Error(`${field} must stay inside the runtime directory without symbolic links`);
   }
@@ -87,6 +89,7 @@ export async function isolatedNode(configPath) {
     SERVER_CERT: cert,
     CA_CERT: ca,
   };
+  // 启动入口与隔离测试复用同一组参数。空环境避免继承 Node.js 启动选项。
   return {
     command: sandbox,
     args: [...Object.entries(parameters).flatMap(([name, value]) => ['-D', `${name}=${value}`]), '-p', profile, node],
@@ -99,6 +102,7 @@ async function main() {
   if (process.argv.length !== 3) throw new Error('Usage: node scripts/start-isolated.mjs <server.json>');
   const { command, args, options, serverArgs } = await isolatedNode(process.argv[2]);
   const child = spawn(command, [...args, ...serverArgs], { ...options, stdio: 'inherit' });
+  // 将终端中断与终止信号转交给实际监听端口的服务进程。
   for (const signal of ['SIGINT', 'SIGTERM']) process.once(signal, () => child.kill(signal));
   child.once('error', error => { console.error(error.message); process.exitCode = 1; });
   child.once('exit', (code, signal) => {

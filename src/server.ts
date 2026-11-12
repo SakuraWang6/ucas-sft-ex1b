@@ -8,6 +8,7 @@ import {
 } from './protocol.js';
 import { AccountStorage, requirePrivateDirectory, RequestError } from './storage.js';
 
+// 服务端认证并调度 SFT1 会话，每个账号的连接共享文件目录、并发名额和带宽额度。
 const MAX_CONNECTIONS = 12;
 const HANDSHAKE_MS = 5_000;
 const KEEPALIVE_MS = 10_000;
@@ -97,6 +98,7 @@ async function handleRequest(send: Reply, user: User, frame: Frame): Promise<boo
         const position = fileInteger(offset, 0, MAX_PAYLOAD, 'download offset');
         const length = fileInteger(bytes, 1, CHUNK_BYTES, 'download chunk length');
         const payload = await files.load(target);
+        // 续传可跨连接，按整文件摘要确认这次读取的分块仍属于同一版本。
         if (digest(payload) !== expected) throw new RequestError('File changed since download began');
         if (position + length > payload.length) throw new RequestError('Chunk exceeds file length');
         await send({
@@ -114,6 +116,7 @@ async function handleRequest(send: Reply, user: User, frame: Frame): Promise<boo
         throw new RequestError('Unknown operation');
     }
   } catch (error) {
+    // 可预期的业务错误作为响应返回，客户端可以继续使用当前会话。
     if (!(error instanceof RequestError)) throw error;
     await send({
       op: typeof op === 'string' && op.length <= 16 ? op : 'unknown',
@@ -130,6 +133,7 @@ async function serveSession(socket: TLSSocket, user: User, id: number): Promise<
   const reader = new FrameReader(socket);
   const closed = new AbortController();
   socket.once('close', () => closed.abort());
+  // 两个传输方向使用同一账号的额度，断开时取消该连接正在等待的限速定时器。
   const pace = (bytes: number) => user.bandwidth.wait(bytes, closed.signal);
   const send: Reply = (header, payload) => writeFrame(socket, header, payload, pace);
   console.log(`SESSION ${id} OPEN ${user.name} ${socket.getProtocol()}`);
@@ -137,7 +141,7 @@ async function serveSession(socket: TLSSocket, user: User, id: number): Promise<
   let requestCount = 0;
   try {
     for (;;) {
-      // The deadline covers the full frame and response, even if a peer trickles bytes.
+      // 每轮依次处理一个请求。固定时限涵盖等待读帧到写完响应，分段到达也不会重置计时。
       const deadline = setTimeout(() => socket.destroy(new Error('Request deadline exceeded')), REQUEST_MS);
       try {
         const frame = await reader.read(pace);
@@ -198,11 +202,13 @@ async function main(): Promise<void> {
     handshakeTimeout: HANDSHAKE_MS,
   }, (socket) => {
     socket.on('error', () => {});
+    // TLS 校验证书链，指纹映射再决定账号及其目录，业务请求无法指定账号。
     const user = users.get(socket.getPeerCertificate().fingerprint256);
     if (!socket.authorized || !user || user.connections >= MAX_ACCOUNT_CONNECTIONS) {
       socket.destroy();
       return;
     }
+    // 会话退出或出错后归还账号的并发名额。
     user.connections += 1;
     void serveSession(socket, user, ++lastSession).finally(() => { user.connections -= 1; });
   });

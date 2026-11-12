@@ -19,6 +19,7 @@ describe('macOS server isolation', { skip: process.platform !== 'darwin' && 'req
   let configFile;
 
   before(async () => {
+    // 每次生成独立证书和数据目录，监听端口由系统分配。
     root = await mkdtemp(join(tmpdir(), 'sft-isolation-'));
     runtime = join(root, 'runtime');
     await exec(node, ['scripts/setup.mjs', runtime], {
@@ -39,6 +40,7 @@ describe('macOS server isolation', { skip: process.platform !== 'darwin' && 'req
     const probeFile = join(runtime, 'storage', 'probe.mjs');
     await writeFile(outside, 'outside marker', { mode: 0o600 });
 
+    // 探针与测试进程使用同一用户身份。用可写模式打开文件来检查权限，保留原内容。
     const probe = `
       import { open, readFile, unlink, writeFile } from 'node:fs/promises';
       const [inside, outside, config, clientKey, serverCert] = process.argv.slice(2);
@@ -88,6 +90,7 @@ describe('macOS server isolation', { skip: process.platform !== 'darwin' && 'req
     let closed = false;
     const exit = new Promise(resolve => server.once('close', () => { closed = true; resolve(); }));
     server.on('error', error => { output += error.message; });
+    // 等服务退出再清理运行目录，避免残留进程继续访问测试文件。
     t.after(async () => {
       server.kill('SIGTERM');
       const timeout = setTimeout(() => server.kill('SIGKILL'), 2000);
